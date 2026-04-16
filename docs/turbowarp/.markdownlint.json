@@ -1,0 +1,11 @@
+{
+  "MD033": {
+    "allowed_elements": [
+      "iframe",
+      "script",
+      "Spoiler",
+      "ExtensionCode"
+    ]
+  },
+  "MD013": false
+}
