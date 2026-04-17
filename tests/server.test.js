@@ -82,12 +82,13 @@ describe('Xserve signalling server', () => {
     serverProc.stdout?.resume();
     serverProc.stderr?.resume();
 
-    serverProc.on('error', err => {
-      throw err;
-    });
-
     try {
-      await waitForServerReady(port, serverProc);
+      await Promise.race([
+        waitForServerReady(port, serverProc),
+        once(serverProc, 'error').then(([err]) => {
+          throw err;
+        }),
+      ]);
     } catch (err) {
       if (serverProc.exitCode === null) {
         serverProc.kill();
