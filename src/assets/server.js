@@ -5,23 +5,94 @@
 
 import WebSocket, { WebSocketServer } from 'ws';
 import chalk from 'chalk';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_MESSAGES_PER_SECOND = 10;
 const RATE_LIMIT_COOLDOWN_MS = 1000;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_ROOMS_DB_PATH = path.resolve(__dirname, '../../xserver-rooms.json');
 
-// Key-Value store for active rooms
-// Format: {
-//   roomName: {
-//     host: WebSocket,
-//     password: string,
-//     isPublic: boolean,
-//     clients: Map<clientId, WebSocket>
-//   }
-// }
-const rooms = {};
+const isPlainObject = value =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+class RoomStore {
+  constructor(filePath = DEFAULT_ROOMS_DB_PATH) {
+    this.filePath = filePath;
+    this.rooms = {};
+  }
+
+  load() {
+    if (!fs.existsSync(this.filePath)) {
+      this.rooms = {};
+      return;
+    }
+
+    try {
+      const rawData = fs.readFileSync(this.filePath, 'utf8');
+      const parsed = JSON.parse(rawData);
+      if (!isPlainObject(parsed)) {
+        this.rooms = {};
+        return;
+      }
+      this.rooms = Object.fromEntries(
+        Object.entries(parsed).map(([roomName, roomData]) => [
+          String(roomName),
+          {
+            password: String(roomData?.password ?? ''),
+            isPublic: roomData?.isPublic === true,
+          },
+        ])
+      );
+    } catch {
+      this.rooms = {};
+    }
+  }
+
+  _persist() {
+    const directory = path.dirname(this.filePath);
+    fs.mkdirSync(directory, { recursive: true });
+    const tempFilePath = `${this.filePath}.tmp`;
+    fs.writeFileSync(tempFilePath, JSON.stringify(this.rooms, null, 2));
+    fs.renameSync(tempFilePath, this.filePath);
+  }
+
+  getRoom(roomName) {
+    return this.rooms[roomName] || null;
+  }
+
+  upsertRoom(roomName, roomData) {
+    this.rooms[roomName] = {
+      password: String(roomData?.password ?? ''),
+      isPublic: roomData?.isPublic === true,
+    };
+    this._persist();
+  }
+
+  deleteRoom(roomName) {
+    if (!this.rooms[roomName]) return;
+    delete this.rooms[roomName];
+    this._persist();
+  }
+
+  getPublicRoomNames() {
+    return Object.entries(this.rooms)
+      .filter(([, roomState]) => !roomState.password || roomState.isPublic)
+      .map(([roomName]) => roomName);
+  }
+}
+
+const roomStore = new RoomStore(
+  process.env.XSERVER_ROOMS_DB_PATH || DEFAULT_ROOMS_DB_PATH
+);
+roomStore.load();
+
+// Format: Map<roomName, { host: WebSocket, clients: Map<clientId, WebSocket> }>
+const activeRooms = new Map();
 let nextClientId = 1;
 
 // --- Logger Utilities ---
@@ -76,11 +147,6 @@ const parsePublicFlag = value =>
   String(value ?? '')
     .trim()
     .toLowerCase() === 'true';
-
-const getPublicRoomNames = () =>
-  Object.entries(rooms)
-    .filter(([, roomState]) => !roomState.password || roomState.isPublic)
-    .map(([roomName]) => roomName);
 
 wss.on('connection', (ws, req) => {
   let currentRoom = null;
@@ -138,7 +204,10 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
-          if (rooms[sanitizedRoom]) {
+          const existingRoom = roomStore.getRoom(sanitizedRoom);
+          const activeRoom = activeRooms.get(sanitizedRoom);
+          const password = String(data.password ?? '');
+          if (activeRoom && activeRoom.host.readyState === WebSocket.OPEN) {
             log.warn(
               `Client ${myClientId} attempted to create existing room: "${sanitizedRoom}"`
             );
@@ -146,12 +215,19 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
-          rooms[sanitizedRoom] = {
-            host: ws,
-            password: data.password || '',
+          if (existingRoom && existingRoom.password !== password) {
+            log.warn(
+              `Client ${myClientId} attempted to create room with invalid credentials: "${sanitizedRoom}"`
+            );
+            ws.send(JSON.stringify({ type: 'error', message: 'Room already exists.' }));
+            return;
+          }
+
+          roomStore.upsertRoom(sanitizedRoom, {
+            password,
             isPublic: parsePublicFlag(data.public),
-            clients: new Map(),
-          };
+          });
+          activeRooms.set(sanitizedRoom, { host: ws, clients: new Map() });
 
           currentRoom = sanitizedRoom;
           isHost = true;
@@ -166,15 +242,27 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
-          const targetRoom = rooms[sanitizedRoom];
-          if (!targetRoom) {
+          const targetRoomRecord = roomStore.getRoom(sanitizedRoom);
+          if (!targetRoomRecord) {
             log.warn(
               `Client ${myClientId} attempted to join non-existent room: "${sanitizedRoom}"`
             );
             ws.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
             return;
           }
-          if (targetRoom.password && targetRoom.password !== data.password) {
+
+          const targetRoom = activeRooms.get(sanitizedRoom);
+          if (!targetRoom || targetRoom.host.readyState !== WebSocket.OPEN) {
+            log.warn(
+              `Client ${myClientId} attempted to join offline room: "${sanitizedRoom}"`
+            );
+            ws.send(
+              JSON.stringify({ type: 'error', message: 'Room is currently offline.' })
+            );
+            return;
+          }
+
+          if (targetRoomRecord.password && targetRoomRecord.password !== data.password) {
             log.warn(
               `Client ${myClientId} failed authentication for room: "${sanitizedRoom}"`
             );
@@ -198,8 +286,9 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'send_to_host': {
-          if (!isHost && currentRoom && rooms[currentRoom]) {
-            rooms[currentRoom].host.send(
+          const currentActiveRoom = currentRoom ? activeRooms.get(currentRoom) : null;
+          if (!isHost && currentActiveRoom) {
+            currentActiveRoom.host.send(
               JSON.stringify({
                 type: 'message',
                 sender: myClientId,
@@ -216,8 +305,9 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'send_to_client': {
-          if (isHost && currentRoom && rooms[currentRoom]) {
-            const targetClient = rooms[currentRoom].clients.get(Number(sanitizedTarget));
+          const currentActiveRoom = currentRoom ? activeRooms.get(currentRoom) : null;
+          if (isHost && currentActiveRoom) {
+            const targetClient = currentActiveRoom.clients.get(Number(sanitizedTarget));
             if (targetClient && targetClient.readyState === WebSocket.OPEN) {
               targetClient.send(
                 JSON.stringify({
@@ -239,9 +329,10 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'broadcast': {
-          if (isHost && currentRoom && rooms[currentRoom]) {
+          const currentActiveRoom = currentRoom ? activeRooms.get(currentRoom) : null;
+          if (isHost && currentActiveRoom) {
             let broadcastCount = 0;
-            rooms[currentRoom].clients.forEach(clientWs => {
+            currentActiveRoom.clients.forEach(clientWs => {
               if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(
                   JSON.stringify({
@@ -261,18 +352,21 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'fetch_rooms': {
-          ws.send(JSON.stringify({ type: 'rooms_list', rooms: getPublicRoomNames() }));
+          ws.send(
+            JSON.stringify({ type: 'rooms_list', rooms: roomStore.getPublicRoomNames() })
+          );
           break;
         }
 
         case 'kick': {
-          if (isHost && currentRoom && rooms[currentRoom]) {
+          const currentActiveRoom = currentRoom ? activeRooms.get(currentRoom) : null;
+          if (isHost && currentActiveRoom) {
             const targetClientId = Number(sanitizedTarget);
-            const targetClient = rooms[currentRoom].clients.get(targetClientId);
+            const targetClient = currentActiveRoom.clients.get(targetClientId);
             if (targetClient && targetClient.readyState === WebSocket.OPEN) {
               targetClient.send(JSON.stringify({ type: 'kicked', by: 'host' }));
               targetClient.close();
-              rooms[currentRoom].clients.delete(targetClientId);
+              currentActiveRoom.clients.delete(targetClientId);
               log.info(
                 `Host kicked client | Room: "${currentRoom}" | Target Client: ${targetClientId}`
               );
@@ -286,9 +380,10 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'delete_room': {
-          if (isHost && currentRoom && rooms[currentRoom]) {
+          const currentActiveRoom = currentRoom ? activeRooms.get(currentRoom) : null;
+          if (isHost && currentRoom && currentActiveRoom) {
             let evictedCount = 0;
-            const clientsToEvict = Array.from(rooms[currentRoom].clients.values());
+            const clientsToEvict = Array.from(currentActiveRoom.clients.values());
             clientsToEvict.forEach(clientWs => {
               if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(
@@ -302,7 +397,8 @@ wss.on('connection', (ws, req) => {
               }
             });
             const deletedRoomName = currentRoom;
-            delete rooms[currentRoom];
+            activeRooms.delete(currentRoom);
+            roomStore.deleteRoom(currentRoom);
             currentRoom = null;
             isHost = false;
             ws.send(JSON.stringify({ type: 'room_deleted', room: deletedRoomName }));
@@ -335,11 +431,12 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     log.info(`Connection closed | Client ID: ${myClientId}`);
 
-    if (currentRoom && rooms[currentRoom]) {
+    const currentActiveRoom = currentRoom ? activeRooms.get(currentRoom) : null;
+    if (currentRoom && currentActiveRoom) {
       if (isHost) {
-        // Host left: Kick all clients and destroy the room
+        // Host left: Kick all clients and keep room metadata for future reconnects
         let evictedCount = 0;
-        const clientsToEvict = Array.from(rooms[currentRoom].clients.values());
+        const clientsToEvict = Array.from(currentActiveRoom.clients.values());
         clientsToEvict.forEach(clientWs => {
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(
@@ -352,15 +449,15 @@ wss.on('connection', (ws, req) => {
             evictedCount++;
           }
         });
-        delete rooms[currentRoom];
+        activeRooms.delete(currentRoom);
         log.warn(
-          `Host disconnected, room destroyed | Room: "${currentRoom}" | Evicted Clients: ${evictedCount}`
+          `Host disconnected, room is now offline | Room: "${currentRoom}" | Evicted Clients: ${evictedCount}`
         );
       } else {
         // Client left: Remove them and notify host
-        rooms[currentRoom].clients.delete(myClientId);
-        if (rooms[currentRoom].host.readyState === WebSocket.OPEN) {
-          rooms[currentRoom].host.send(
+        currentActiveRoom.clients.delete(myClientId);
+        if (currentActiveRoom.host.readyState === WebSocket.OPEN) {
+          currentActiveRoom.host.send(
             JSON.stringify({ type: 'client_left', id: myClientId })
           );
         }
