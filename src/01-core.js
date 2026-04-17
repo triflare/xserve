@@ -177,7 +177,10 @@ class tfXserve {
           this.currentRoom = msg.room;
           this.myId = msg.id;
         } else if (msg.type === 'error') {
-          const safeErrorMessage = Scratch.Cast.toString(msg.message).replace(/[\r\n]/g, '');
+          const safeErrorMessage = Scratch.Cast.toString(msg.message).replace(
+            /[\r\n]/g,
+            ''
+          );
           console.error('Xserve Error:', safeErrorMessage);
         }
 
