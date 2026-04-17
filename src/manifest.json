@@ -5,5 +5,5 @@
   "description": "Host and connect to WebSocket servers with star topologies.",
   "author": "Triflare",
   "license": "GPL-3.0-only",
-  "url": "https://github.com/xserve-project/xserve"
+  "url": "https://github.com/triflare/xserve"
 }
