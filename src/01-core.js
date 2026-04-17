@@ -19,6 +19,10 @@ class tfXserve {
 
     this._currentActionResolve = null;
     this._actionTimeout = null;
+    this._publicRoomsCache = [];
+    this._publicRoomsResolve = null;
+    this._publicRoomsTimeout = null;
+    this._heartbeatInterval = null;
   }
 
   getInfo() {
@@ -41,7 +45,7 @@ class tfXserve {
           arguments: {
             URL: {
               type: Scratch.ArgumentType.STRING,
-              defaultValue: 'wss://something.website.com:1234',
+              defaultValue: '',
             },
           },
         },
@@ -54,10 +58,16 @@ class tfXserve {
         {
           opcode: 'createRoom',
           blockType: Scratch.BlockType.COMMAND,
-          text: Scratch.translate('create server with name [ROOM] password [PASS]'),
+          text: Scratch.translate(
+            'create server with name [ROOM] password [PASS] visibility [VISIBILITY]'
+          ),
           arguments: {
             ROOM: { type: Scratch.ArgumentType.STRING, defaultValue: 'myServer' },
             PASS: { type: Scratch.ArgumentType.STRING, defaultValue: 'AbCdEfG!' },
+            VISIBILITY: {
+              type: Scratch.ArgumentType.STRING,
+              menu: 'ROOM_VISIBILITY',
+            },
           },
         },
         {
@@ -87,6 +97,12 @@ class tfXserve {
         },
         '---',
         {
+          opcode: 'getPublicRooms',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('public servers'),
+        },
+        '---',
+        {
           opcode: 'sendToHost',
           blockType: Scratch.BlockType.COMMAND,
           text: Scratch.translate('client: send message [DATA] to host'),
@@ -112,6 +128,14 @@ class tfXserve {
               type: Scratch.ArgumentType.STRING,
               defaultValue: 'Attention everyone!',
             },
+          },
+        },
+        {
+          opcode: 'kickClient',
+          blockType: Scratch.BlockType.COMMAND,
+          text: Scratch.translate('host: kick client ID [ID]'),
+          arguments: {
+            ID: { type: Scratch.ArgumentType.STRING, defaultValue: '1' },
           },
         },
         '---',
@@ -157,6 +181,13 @@ class tfXserve {
             { text: Scratch.translate('leaves the server'), value: 'left' },
           ],
         },
+        ROOM_VISIBILITY: {
+          acceptReporters: false,
+          items: [
+            { text: Scratch.translate('public'), value: 'public' },
+            { text: Scratch.translate('private'), value: 'private' },
+          ],
+        },
       },
     };
   }
@@ -194,6 +225,31 @@ class tfXserve {
       }
 
       // Handle Gameplay Phase Events
+      if (msg.type === 'pong') {
+        return;
+      }
+
+      if (msg.type === 'rooms_list') {
+        this._publicRoomsCache = Array.isArray(msg.rooms)
+          ? msg.rooms.map(room => Scratch.Cast.toString(room))
+          : [];
+        if (this._publicRoomsResolve) {
+          this._publicRoomsResolve(this._formatPublicRooms());
+          this._publicRoomsResolve = null;
+          clearTimeout(this._publicRoomsTimeout);
+          this._publicRoomsTimeout = null;
+        }
+        return;
+      }
+
+      if (msg.type === 'kicked') {
+        console.warn('Xserve: You were removed from the room by the host.');
+        if (this.ws) {
+          this.ws.close();
+        }
+        return;
+      }
+
       if (msg.type === 'message') {
         this.lastMessage = msg.data;
         this.lastSender = msg.sender;
@@ -217,6 +273,26 @@ class tfXserve {
       }
     } catch (err) {
       console.error('Failed to parse WebSocket message', err);
+    }
+  }
+
+  _formatPublicRooms() {
+    return this._publicRoomsCache.join(', ');
+  }
+
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    this._heartbeatInterval = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 30000);
+  }
+
+  _stopHeartbeat() {
+    if (this._heartbeatInterval) {
+      clearInterval(this._heartbeatInterval);
+      this._heartbeatInterval = null;
     }
   }
 
@@ -263,10 +339,12 @@ class tfXserve {
       }
 
       this.ws.onopen = () => {
+        this._startHeartbeat();
         resolve();
       };
 
       this.ws.onclose = () => {
+        this._stopHeartbeat();
         this.connected = false;
         this.isHost = false;
         this.currentRoom = '';
@@ -283,6 +361,12 @@ class tfXserve {
   }
 
   disconnect() {
+    this._stopHeartbeat();
+    if (this._publicRoomsTimeout) {
+      clearTimeout(this._publicRoomsTimeout);
+      this._publicRoomsTimeout = null;
+    }
+    this._publicRoomsResolve = null;
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -299,6 +383,7 @@ class tfXserve {
           type: 'create',
           room: Scratch.Cast.toString(args.ROOM),
           password: Scratch.Cast.toString(args.PASS),
+          public: Scratch.Cast.toString(args.VISIBILITY) === 'public',
         },
         resolve
       );
@@ -332,6 +417,31 @@ class tfXserve {
   }
   getLastSender() {
     return this.lastSender;
+  }
+  getPublicRooms() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return this._formatPublicRooms();
+    }
+
+    return new Promise(resolve => {
+      if (this._publicRoomsResolve) {
+        this._publicRoomsResolve(this._formatPublicRooms());
+      }
+
+      this._publicRoomsResolve = resolve;
+
+      if (this._publicRoomsTimeout) {
+        clearTimeout(this._publicRoomsTimeout);
+      }
+      this._publicRoomsTimeout = setTimeout(() => {
+        if (this._publicRoomsResolve) {
+          this._publicRoomsResolve(this._formatPublicRooms());
+          this._publicRoomsResolve = null;
+        }
+      }, 3000);
+
+      this.ws.send(JSON.stringify({ type: 'fetch_rooms' }));
+    });
   }
 
   whenMessageReceived() {
@@ -385,6 +495,17 @@ class tfXserve {
         JSON.stringify({
           type: 'broadcast',
           data: Scratch.Cast.toString(args.DATA),
+        })
+      );
+    }
+  }
+
+  kickClient(args) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.isHost) {
+      this.ws.send(
+        JSON.stringify({
+          type: 'kick',
+          target: Scratch.Cast.toString(args.ID),
         })
       );
     }

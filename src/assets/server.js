@@ -8,9 +8,19 @@ import chalk from 'chalk';
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
+const MAX_MESSAGE_BYTES = 64 * 1024;
+const MAX_MESSAGES_PER_SECOND = 10;
+const RATE_LIMIT_COOLDOWN_MS = 1000;
 
 // Key-Value store for active rooms
-// Format: { roomName: { host: WebSocket, password: "...", clients: Map<clientId, WebSocket> } }
+// Format: {
+//   roomName: {
+//     host: WebSocket,
+//     password: string,
+//     isPublic: boolean,
+//     clients: Map<clientId, WebSocket>
+//   }
+// }
 const rooms = {};
 let nextClientId = 1;
 
@@ -55,37 +65,95 @@ log.success(`Server initialized successfully.`);
 log.info(`Listening for WebSocket connections on port ${PORT}`);
 log.info(`Local Endpoint: ws://localhost:${PORT}\n`);
 
+const sanitizeAlphaNumeric = value => {
+  const trimmed = String(value ?? '').trim();
+  if (!trimmed) return '';
+  return /^[a-z0-9]+$/i.test(trimmed) ? trimmed : '';
+};
+
+const parsePublicFlag = value =>
+  value === true ||
+  String(value ?? '')
+    .trim()
+    .toLowerCase() === 'true';
+
+const getPublicRoomNames = () =>
+  Object.entries(rooms)
+    .filter(([, roomState]) => !roomState.password || roomState.isPublic)
+    .map(([roomName]) => roomName);
+
 wss.on('connection', (ws, req) => {
   let currentRoom = null;
   let isHost = false;
   const myClientId = nextClientId++;
   const clientIp = req.socket.remoteAddress;
+  let rateWindowStart = Date.now();
+  let rateWindowCount = 0;
+  let blockedUntil = 0;
 
   log.info(`New connection established | Client ID: ${myClientId} | IP: ${clientIp}`);
 
-  ws.on('message', messageAsString => {
+  ws.on('message', rawMessage => {
+    const now = Date.now();
+    const messageSize = Buffer.isBuffer(rawMessage)
+      ? rawMessage.length
+      : Buffer.byteLength(String(rawMessage), 'utf8');
+
+    if (messageSize > MAX_MESSAGE_BYTES) {
+      log.warn(
+        `Ignored oversized payload from Client ${myClientId} (${messageSize} bytes > ${MAX_MESSAGE_BYTES} bytes)`
+      );
+      return;
+    }
+
+    if (now - rateWindowStart >= 1000) {
+      rateWindowStart = now;
+      rateWindowCount = 0;
+    }
+    rateWindowCount++;
+
+    if (now < blockedUntil) {
+      return;
+    }
+    if (rateWindowCount > MAX_MESSAGES_PER_SECOND) {
+      blockedUntil = now + RATE_LIMIT_COOLDOWN_MS;
+      log.warn(
+        `Rate limit triggered for Client ${myClientId}; ignoring input until cooldown ends`
+      );
+      return;
+    }
+
+    const messageAsString = rawMessage.toString();
     log.verbose(`Raw payload from Client ${myClientId}: ${messageAsString}`);
 
     try {
       const data = JSON.parse(messageAsString);
+      const sanitizedRoom = sanitizeAlphaNumeric(data.room);
+      const sanitizedTarget = sanitizeAlphaNumeric(data.target);
 
       switch (data.type) {
         case 'create': {
-          if (rooms[data.room]) {
+          if (!sanitizedRoom) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid room name.' }));
+            return;
+          }
+
+          if (rooms[sanitizedRoom]) {
             log.warn(
-              `Client ${myClientId} attempted to create existing room: "${data.room}"`
+              `Client ${myClientId} attempted to create existing room: "${sanitizedRoom}"`
             );
             ws.send(JSON.stringify({ type: 'error', message: 'Room already exists.' }));
             return;
           }
 
-          rooms[data.room] = {
+          rooms[sanitizedRoom] = {
             host: ws,
             password: data.password || '',
+            isPublic: parsePublicFlag(data.public),
             clients: new Map(),
           };
 
-          currentRoom = data.room;
+          currentRoom = sanitizedRoom;
           isHost = true;
           ws.send(JSON.stringify({ type: 'created', room: currentRoom }));
           log.success(`Room created | Room: "${currentRoom}" | Host ID: ${myClientId}`);
@@ -93,23 +161,28 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'join': {
-          const targetRoom = rooms[data.room];
+          if (!sanitizedRoom) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid room name.' }));
+            return;
+          }
+
+          const targetRoom = rooms[sanitizedRoom];
           if (!targetRoom) {
             log.warn(
-              `Client ${myClientId} attempted to join non-existent room: "${data.room}"`
+              `Client ${myClientId} attempted to join non-existent room: "${sanitizedRoom}"`
             );
             ws.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
             return;
           }
           if (targetRoom.password && targetRoom.password !== data.password) {
             log.warn(
-              `Client ${myClientId} failed authentication for room: "${data.room}"`
+              `Client ${myClientId} failed authentication for room: "${sanitizedRoom}"`
             );
             ws.send(JSON.stringify({ type: 'error', message: 'Incorrect password.' }));
             return;
           }
 
-          currentRoom = data.room;
+          currentRoom = sanitizedRoom;
           isHost = false;
           targetRoom.clients.set(myClientId, ws);
 
@@ -144,7 +217,7 @@ wss.on('connection', (ws, req) => {
 
         case 'send_to_client': {
           if (isHost && currentRoom && rooms[currentRoom]) {
-            const targetClient = rooms[currentRoom].clients.get(Number(data.target));
+            const targetClient = rooms[currentRoom].clients.get(Number(sanitizedTarget));
             if (targetClient && targetClient.readyState === WebSocket.OPEN) {
               targetClient.send(
                 JSON.stringify({
@@ -154,11 +227,11 @@ wss.on('connection', (ws, req) => {
                 })
               );
               log.verbose(
-                `Message routed to client | Target: ${data.target} | Room: "${currentRoom}"`
+                `Message routed to client | Target: ${sanitizedTarget} | Room: "${currentRoom}"`
               );
             } else {
               log.warn(
-                `Host attempted to send to invalid client | Target: ${data.target}`
+                `Host attempted to send to invalid client | Target: ${sanitizedTarget}`
               );
             }
           }
@@ -184,6 +257,36 @@ wss.on('connection', (ws, req) => {
               `Broadcast sent | Room: "${currentRoom}" | Recipients: ${broadcastCount}`
             );
           }
+          break;
+        }
+
+        case 'fetch_rooms': {
+          ws.send(JSON.stringify({ type: 'rooms_list', rooms: getPublicRoomNames() }));
+          break;
+        }
+
+        case 'kick': {
+          if (isHost && currentRoom && rooms[currentRoom]) {
+            const targetClientId = Number(sanitizedTarget);
+            const targetClient = rooms[currentRoom].clients.get(targetClientId);
+            if (targetClient && targetClient.readyState === WebSocket.OPEN) {
+              targetClient.send(JSON.stringify({ type: 'kicked', by: 'host' }));
+              targetClient.close();
+              rooms[currentRoom].clients.delete(targetClientId);
+              log.info(
+                `Host kicked client | Room: "${currentRoom}" | Target Client: ${targetClientId}`
+              );
+            } else {
+              log.warn(
+                `Host attempted to kick invalid client | Room: "${currentRoom}" | Target: ${sanitizedTarget}`
+              );
+            }
+          }
+          break;
+        }
+
+        case 'ping': {
+          ws.send(JSON.stringify({ type: 'pong' }));
           break;
         }
 
