@@ -3,7 +3,7 @@
   "id": "tfXserve",
   "version": "1.0.1",
   "description": "Host and connect to WebSocket servers with star topologies.",
-  "author": "Triflare",
+  "author": "Xserve Contributors",
   "license": "GPL-3.0-only",
-  "url": "https://github.com/triflare/xserve"
+  "url": "https://github.com/xserve-project/xserve"
 }

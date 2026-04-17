@@ -426,18 +426,20 @@ class tfXserve {
     return new Promise(resolve => {
       if (this._publicRoomsResolve) {
         this._publicRoomsResolve(this._formatPublicRooms());
+        this._publicRoomsResolve = null;
+      }
+      if (this._publicRoomsTimeout) {
+        clearTimeout(this._publicRoomsTimeout);
+        this._publicRoomsTimeout = null;
       }
 
       this._publicRoomsResolve = resolve;
-
-      if (this._publicRoomsTimeout) {
-        clearTimeout(this._publicRoomsTimeout);
-      }
       this._publicRoomsTimeout = setTimeout(() => {
         if (this._publicRoomsResolve) {
           this._publicRoomsResolve(this._formatPublicRooms());
           this._publicRoomsResolve = null;
         }
+        this._publicRoomsTimeout = null;
       }, 3000);
 
       this.ws.send(JSON.stringify({ type: 'fetch_rooms' }));

@@ -127,12 +127,17 @@ describe('Xserve extension', () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
 
-    const result = extension.createRoom({ ROOM: 'myRoom', PASS: 'secret' });
+    const result = extension.createRoom({
+      ROOM: 'myRoom',
+      PASS: 'secret',
+      VISIBILITY: 'public',
+    });
     assert.equal(ws.sentMessages.length, 1);
     const payload = JSON.parse(ws.sentMessages[0]);
     assert.equal(payload.type, 'create');
     assert.equal(payload.room, 'myRoom');
     assert.equal(payload.password, 'secret');
+    assert.equal(payload.public, true);
 
     ws.onmessage({ data: JSON.stringify({ type: 'created', room: 'myRoom' }) });
     await result;
@@ -198,7 +203,8 @@ describe('Xserve extension', () => {
     extension.isHost = true;
     extension.sendToClient({ ID: '1', DATA: 'hello' });
     extension.broadcast({ DATA: 'everyone' });
-    assert.equal(ws.sentMessages.length, 3);
+    extension.kickClient({ ID: '1' });
+    assert.equal(ws.sentMessages.length, 4);
     assert.deepEqual(JSON.parse(ws.sentMessages[1]), {
       type: 'send_to_client',
       target: '1',
@@ -208,6 +214,22 @@ describe('Xserve extension', () => {
       type: 'broadcast',
       data: 'everyone',
     });
+    assert.deepEqual(JSON.parse(ws.sentMessages[3]), {
+      type: 'kick',
+      target: '1',
+    });
+  });
+
+  it('fetches public room names from the server', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const pending = extension.getPublicRooms();
+    assert.deepEqual(JSON.parse(ws.sentMessages[0]), { type: 'fetch_rooms' });
+    ws.onmessage({ data: JSON.stringify({ type: 'rooms_list', rooms: ['lobby', 'openroom'] }) });
+
+    const result = await pending;
+    assert.equal(result, 'lobby, openroom');
   });
 
   it('downloads the server asset to the expected filename', () => {
