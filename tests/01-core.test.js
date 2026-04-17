@@ -75,9 +75,16 @@ function clearExtensionState() {
   extension._messageQueue = [];
   extension._clientEventQueue = [];
   extension._currentActionResolve = null;
+  extension._publicRoomsCache = [];
+  extension._publicRoomsInFlightPromise = null;
+  extension._publicRoomsLastFetchAt = 0;
   if (extension._actionTimeout) {
     clearTimeout(extension._actionTimeout);
     extension._actionTimeout = null;
+  }
+  if (extension._publicRoomsTimeout) {
+    clearTimeout(extension._publicRoomsTimeout);
+    extension._publicRoomsTimeout = null;
   }
 }
 
@@ -103,6 +110,7 @@ describe('Xserve extension', () => {
     assert.ok(Array.isArray(info.blocks));
     assert.ok(info.blocks.length > 0);
     assert.ok(info.menus.CLIENT_EVENTS.items.some(item => item.value === 'joined'));
+    assert.ok(info.blocks.some(block => block.opcode === 'deleteServer'));
   });
 
   it('connectToServer resolves when WebSocket opens', async () => {
@@ -204,7 +212,8 @@ describe('Xserve extension', () => {
     extension.sendToClient({ ID: '1', DATA: 'hello' });
     extension.broadcast({ DATA: 'everyone' });
     extension.kickClient({ ID: '1' });
-    assert.equal(ws.sentMessages.length, 4);
+    extension.deleteServer();
+    assert.equal(ws.sentMessages.length, 5);
     assert.deepEqual(JSON.parse(ws.sentMessages[1]), {
       type: 'send_to_client',
       target: '1',
@@ -218,6 +227,9 @@ describe('Xserve extension', () => {
       type: 'kick',
       target: '1',
     });
+    assert.deepEqual(JSON.parse(ws.sentMessages[4]), {
+      type: 'delete_room',
+    });
   });
 
   it('fetches public room names from the server', async () => {
@@ -230,6 +242,35 @@ describe('Xserve extension', () => {
 
     const result = await pending;
     assert.equal(result, 'lobby, openroom');
+
+    ws.sentMessages.length = 0;
+    const cached = extension.getPublicRooms();
+    assert.equal(cached, 'lobby, openroom');
+    assert.equal(ws.sentMessages.length, 0);
+  });
+
+  it('reuses in-flight getPublicRooms request and resolves pending request on close', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const pendingA = extension.getPublicRooms();
+    const pendingB = extension.getPublicRooms();
+    assert.equal(pendingA, pendingB);
+    assert.equal(ws.sentMessages.length, 1);
+    assert.deepEqual(JSON.parse(ws.sentMessages[0]), { type: 'fetch_rooms' });
+
+    ws.close();
+    const result = await pendingA;
+    assert.equal(result, '');
+    assert.equal(extension._publicRoomsInFlightPromise, null);
+  });
+
+  it('clears host room state when room_deleted is received', () => {
+    extension.isHost = true;
+    extension.currentRoom = 'myRoom';
+    extension._handleMessage(JSON.stringify({ type: 'room_deleted', room: 'myRoom' }));
+    assert.equal(extension.isHost, false);
+    assert.equal(extension.currentRoom, '');
   });
 
   it('downloads the server asset to the expected filename', () => {

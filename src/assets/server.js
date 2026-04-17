@@ -285,6 +285,35 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'delete_room': {
+          if (isHost && currentRoom && rooms[currentRoom]) {
+            let evictedCount = 0;
+            rooms[currentRoom].clients.forEach(clientWs => {
+              if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(
+                  JSON.stringify({
+                    type: 'error',
+                    message: 'Host deleted this room.',
+                  })
+                );
+                clientWs.close();
+                evictedCount++;
+              }
+            });
+            const deletedRoomName = currentRoom;
+            delete rooms[currentRoom];
+            currentRoom = null;
+            isHost = false;
+            ws.send(JSON.stringify({ type: 'room_deleted', room: deletedRoomName }));
+            log.info(
+              `Host deleted room | Room: "${deletedRoomName}" | Evicted Clients: ${evictedCount}`
+            );
+          } else {
+            log.warn(`Invalid delete_room attempt | Client ID: ${myClientId}`);
+          }
+          break;
+        }
+
         case 'ping': {
           ws.send(JSON.stringify({ type: 'pong' }));
           break;

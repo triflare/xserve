@@ -4,6 +4,7 @@ if (!Scratch.extensions.unsandboxed) {
 
 const HEARTBEAT_INTERVAL_MS = 30000;
 const PUBLIC_ROOMS_TIMEOUT_MS = 3000;
+const PUBLIC_ROOMS_REFRESH_MS = 5000;
 
 class tfXserve {
   constructor() {
@@ -25,6 +26,8 @@ class tfXserve {
     this._publicRoomsCache = [];
     this._publicRoomsResolve = null;
     this._publicRoomsTimeout = null;
+    this._publicRoomsInFlightPromise = null;
+    this._publicRoomsLastFetchAt = 0;
     this._heartbeatInterval = null;
   }
 
@@ -141,6 +144,11 @@ class tfXserve {
             ID: { type: Scratch.ArgumentType.STRING, defaultValue: '1' },
           },
         },
+        {
+          opcode: 'deleteServer',
+          blockType: Scratch.BlockType.COMMAND,
+          text: Scratch.translate('host: delete my server'),
+        },
         '---',
         {
           opcode: 'whenMessageReceived',
@@ -236,12 +244,16 @@ class tfXserve {
         this._publicRoomsCache = Array.isArray(msg.rooms)
           ? msg.rooms.map(room => Scratch.Cast.toString(room))
           : [];
+        this._publicRoomsLastFetchAt = Date.now();
         if (this._publicRoomsResolve) {
           this._publicRoomsResolve(this._formatPublicRooms());
           this._publicRoomsResolve = null;
+        }
+        if (this._publicRoomsTimeout) {
           clearTimeout(this._publicRoomsTimeout);
           this._publicRoomsTimeout = null;
         }
+        this._publicRoomsInFlightPromise = null;
         return;
       }
 
@@ -250,6 +262,12 @@ class tfXserve {
         if (this.ws) {
           this.ws.close();
         }
+        return;
+      }
+
+      if (msg.type === 'room_deleted') {
+        this.isHost = false;
+        this.currentRoom = '';
         return;
       }
 
@@ -281,6 +299,19 @@ class tfXserve {
 
   _formatPublicRooms() {
     return this._publicRoomsCache.join(', ');
+  }
+
+  _clearPendingPublicRoomsRequest(resolveWithCache) {
+    if (this._publicRoomsTimeout) {
+      clearTimeout(this._publicRoomsTimeout);
+      this._publicRoomsTimeout = null;
+    }
+    const pendingResolve = this._publicRoomsResolve;
+    this._publicRoomsResolve = null;
+    this._publicRoomsInFlightPromise = null;
+    if (resolveWithCache && pendingResolve) {
+      pendingResolve(this._formatPublicRooms());
+    }
   }
 
   _startHeartbeat() {
@@ -348,6 +379,7 @@ class tfXserve {
 
       this.ws.onclose = () => {
         this._stopHeartbeat();
+        this._clearPendingPublicRoomsRequest(true);
         this.connected = false;
         this.isHost = false;
         this.currentRoom = '';
@@ -365,11 +397,7 @@ class tfXserve {
 
   disconnect() {
     this._stopHeartbeat();
-    if (this._publicRoomsTimeout) {
-      clearTimeout(this._publicRoomsTimeout);
-      this._publicRoomsTimeout = null;
-    }
-    this._publicRoomsResolve = null;
+    this._clearPendingPublicRoomsRequest(true);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -425,28 +453,27 @@ class tfXserve {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return this._formatPublicRooms();
     }
+    if (this._publicRoomsInFlightPromise) {
+      return this._publicRoomsInFlightPromise;
+    }
+    if (Date.now() - this._publicRoomsLastFetchAt < PUBLIC_ROOMS_REFRESH_MS) {
+      return this._formatPublicRooms();
+    }
 
-    return new Promise(resolve => {
-      if (this._publicRoomsResolve) {
-        this._publicRoomsResolve(this._formatPublicRooms());
-        this._publicRoomsResolve = null;
-      }
-      if (this._publicRoomsTimeout) {
-        clearTimeout(this._publicRoomsTimeout);
-        this._publicRoomsTimeout = null;
-      }
-
+    this._publicRoomsInFlightPromise = new Promise(resolve => {
       this._publicRoomsResolve = resolve;
       this._publicRoomsTimeout = setTimeout(() => {
         if (this._publicRoomsResolve) {
           this._publicRoomsResolve(this._formatPublicRooms());
           this._publicRoomsResolve = null;
         }
+        this._publicRoomsInFlightPromise = null;
         this._publicRoomsTimeout = null;
       }, PUBLIC_ROOMS_TIMEOUT_MS);
 
       this.ws.send(JSON.stringify({ type: 'fetch_rooms' }));
     });
+    return this._publicRoomsInFlightPromise;
   }
 
   whenMessageReceived() {
@@ -511,6 +538,16 @@ class tfXserve {
         JSON.stringify({
           type: 'kick',
           target: Scratch.Cast.toString(args.ID),
+        })
+      );
+    }
+  }
+
+  deleteServer() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.isHost) {
+      this.ws.send(
+        JSON.stringify({
+          type: 'delete_room',
         })
       );
     }
