@@ -177,7 +177,8 @@ class tfXserve {
           this.currentRoom = msg.room;
           this.myId = msg.id;
         } else if (msg.type === 'error') {
-          console.error('Xserve Error:', msg.message);
+          const safeErrorMessage = Scratch.Cast.toString(msg.message).replace(/[\r\n]/g, '');
+          console.error('Xserve Error:', safeErrorMessage);
         }
 
         // Release the pending block
