@@ -76,11 +76,28 @@ describe('Xserve signalling server', () => {
       env: { ...process.env, PORT: String(port) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    await waitForServerReady(port, serverProc);
+
+    // Ensure the child process output is drained so stdout/stderr buffering
+    // cannot block the server process in CI environments.
+    serverProc.stdout?.resume();
+    serverProc.stderr?.resume();
+
+    serverProc.on('error', err => {
+      throw err;
+    });
+
+    try {
+      await waitForServerReady(port, serverProc);
+    } catch (err) {
+      if (serverProc.exitCode === null) {
+        serverProc.kill();
+      }
+      throw err;
+    }
   });
 
   after(async () => {
-    if (serverProc.exitCode === null) {
+    if (serverProc && serverProc.exitCode === null) {
       serverProc.kill('SIGTERM');
       await once(serverProc, 'exit');
     }
