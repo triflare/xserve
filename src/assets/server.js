@@ -110,11 +110,11 @@ wss.on('connection', (ws, req) => {
       rateWindowStart = now;
       rateWindowCount = 0;
     }
-    rateWindowCount++;
 
     if (now < blockedUntil) {
       return;
     }
+    rateWindowCount++;
     if (rateWindowCount > MAX_MESSAGES_PER_SECOND) {
       blockedUntil = now + RATE_LIMIT_COOLDOWN_MS;
       log.warn(

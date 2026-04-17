@@ -2,6 +2,9 @@ if (!Scratch.extensions.unsandboxed) {
   throw new Error('Xserve must be run unsandboxed to handle events properly.');
 }
 
+const HEARTBEAT_INTERVAL_MS = 30000;
+const PUBLIC_ROOMS_TIMEOUT_MS = 3000;
+
 class tfXserve {
   constructor() {
     this.ws = null;
@@ -45,7 +48,7 @@ class tfXserve {
           arguments: {
             URL: {
               type: Scratch.ArgumentType.STRING,
-              defaultValue: '',
+              defaultValue: 'wss://your-server-url',
             },
           },
         },
@@ -286,7 +289,7 @@ class tfXserve {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: 'ping' }));
       }
-    }, 30000);
+    }, HEARTBEAT_INTERVAL_MS);
   }
 
   _stopHeartbeat() {
@@ -440,7 +443,7 @@ class tfXserve {
           this._publicRoomsResolve = null;
         }
         this._publicRoomsTimeout = null;
-      }, 3000);
+      }, PUBLIC_ROOMS_TIMEOUT_MS);
 
       this.ws.send(JSON.stringify({ type: 'fetch_rooms' }));
     });
