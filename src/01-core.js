@@ -268,6 +268,8 @@ class tfXserve {
       if (msg.type === 'room_deleted') {
         this.isHost = false;
         this.currentRoom = '';
+        this.connected = false;
+        this.myId = '';
         return;
       }
 
@@ -363,21 +365,26 @@ class tfXserve {
     }
 
     return new Promise(resolve => {
+      let socket;
       try {
         // eslint-disable-next-line turbowarp/check-can-fetch
-        this.ws = new WebSocket(url);
+        socket = new WebSocket(url);
       } catch (e) {
         console.error('Xserve: Invalid URL', e);
         resolve();
         return;
       }
 
-      this.ws.onopen = () => {
+      this.ws = socket;
+
+      socket.onopen = () => {
+        if (this.ws !== socket) return;
         this._startHeartbeat();
         resolve();
       };
 
-      this.ws.onclose = () => {
+      socket.onclose = () => {
+        if (this.ws !== socket) return;
         this._stopHeartbeat();
         this._clearPendingPublicRoomsRequest(true);
         this.connected = false;
@@ -386,9 +393,13 @@ class tfXserve {
         this.myId = '';
       };
 
-      this.ws.onmessage = e => this._handleMessage(e.data);
+      socket.onmessage = e => {
+        if (this.ws !== socket) return;
+        this._handleMessage(e.data);
+      };
 
-      this.ws.onerror = () => {
+      socket.onerror = () => {
+        if (this.ws !== socket) return;
         console.error('Xserve: Connection failed');
         resolve();
       };

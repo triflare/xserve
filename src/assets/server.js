@@ -81,17 +81,33 @@ class RoomStore {
   }
 
   upsertRoom(roomName, roomData) {
+    const priorState = this.rooms[roomName];
     this.rooms[roomName] = {
       password: String(roomData?.password ?? ''),
       isPublic: roomData?.isPublic === true,
     };
-    this._persist();
+    try {
+      this._persist();
+    } catch (error) {
+      if (priorState === undefined) {
+        delete this.rooms[roomName];
+      } else {
+        this.rooms[roomName] = priorState;
+      }
+      throw error;
+    }
   }
 
   deleteRoom(roomName) {
-    if (!this.rooms[roomName]) return;
+    const priorState = this.rooms[roomName];
+    if (priorState === undefined) return;
     delete this.rooms[roomName];
-    this._persist();
+    try {
+      this._persist();
+    } catch (error) {
+      this.rooms[roomName] = priorState;
+      throw error;
+    }
   }
 
   getPublicRoomNames() {
@@ -387,9 +403,10 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'fetch_rooms': {
-          ws.send(
-            JSON.stringify({ type: 'rooms_list', rooms: roomStore.getPublicRoomNames() })
-          );
+          const activePublicRooms = roomStore
+            .getPublicRoomNames()
+            .filter(roomName => activeRooms.has(roomName));
+          ws.send(JSON.stringify({ type: 'rooms_list', rooms: activePublicRooms }));
           break;
         }
 

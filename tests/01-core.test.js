@@ -2,7 +2,7 @@
  * Unit tests for src/01-core.js — Xserve Scratch extension
  */
 
-import { describe, it, before, beforeEach, after } from 'node:test';
+import { describe, it, before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { installScratchMock } from './helpers/mock-scratch.js';
 
@@ -98,6 +98,10 @@ describe('Xserve extension', () => {
     clearExtensionState();
   });
 
+  afterEach(() => {
+    clearExtensionState();
+  });
+
   after(() => {
     delete globalThis.WebSocket;
     restore();
@@ -153,6 +157,40 @@ describe('Xserve extension', () => {
     assert.equal(extension.connected, true);
     assert.equal(extension.isHost, true);
     assert.equal(extension.currentRoom, 'myRoom');
+  });
+
+  it('sends private and default room create payloads as non-public', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const privateResult = extension.createRoom({
+      ROOM: 'privateRoom',
+      PASS: 'secret',
+      VISIBILITY: 'private',
+    });
+    assert.equal(ws.sentMessages.length, 1);
+    let payload = JSON.parse(ws.sentMessages[0]);
+    assert.equal(payload.type, 'create');
+    assert.equal(payload.room, 'privateRoom');
+    assert.equal(payload.password, 'secret');
+    assert.equal(payload.public, false);
+
+    ws.onmessage({ data: JSON.stringify({ type: 'created', room: 'privateRoom' }) });
+    await privateResult;
+
+    const defaultResult = extension.createRoom({
+      ROOM: 'defaultRoom',
+      PASS: 'secret',
+    });
+    assert.equal(ws.sentMessages.length, 2);
+    payload = JSON.parse(ws.sentMessages[1]);
+    assert.equal(payload.type, 'create');
+    assert.equal(payload.room, 'defaultRoom');
+    assert.equal(payload.password, 'secret');
+    assert.equal(payload.public, false);
+
+    ws.onmessage({ data: JSON.stringify({ type: 'created', room: 'defaultRoom' }) });
+    await defaultResult;
   });
 
   it('joins a room and updates client state when received joined response', async () => {
