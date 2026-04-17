@@ -5,6 +5,7 @@
 
 import WebSocket, { WebSocketServer } from 'ws';
 import chalk from 'chalk';
+import { timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -48,7 +49,14 @@ class RoomStore {
           },
         ])
       );
-    } catch {
+    } catch (error) {
+      const safeErrorMessage = String(error?.message ?? 'Unknown error')
+        .replace(/[\r\n]/g, '')
+        .replace(/[^\x20-\x7E]/g, '')
+        .slice(0, 200);
+      console.warn(
+        `Unable to read persisted rooms database at "${this.filePath}"; starting with an empty store (${safeErrorMessage})`
+      );
       this.rooms = {};
     }
   }
@@ -58,7 +66,14 @@ class RoomStore {
     fs.mkdirSync(directory, { recursive: true });
     const tempFilePath = `${this.filePath}.tmp`;
     fs.writeFileSync(tempFilePath, JSON.stringify(this.rooms, null, 2));
-    fs.renameSync(tempFilePath, this.filePath);
+    try {
+      fs.renameSync(tempFilePath, this.filePath);
+    } catch (error) {
+      if (fs.existsSync(tempFilePath)) {
+        fs.rmSync(tempFilePath, { force: true });
+      }
+      throw error;
+    }
   }
 
   getRoom(roomName) {
@@ -85,6 +100,23 @@ class RoomStore {
       .map(([roomName]) => roomName);
   }
 }
+
+const safeStringEquals = (left, right) => {
+  const leftBuffer = Buffer.from(String(left ?? ''), 'utf8');
+  const rightBuffer = Buffer.from(String(right ?? ''), 'utf8');
+  const maxLength = Math.max(leftBuffer.length, rightBuffer.length, 1);
+  const leftPadded = Buffer.alloc(maxLength);
+  const rightPadded = Buffer.alloc(maxLength);
+  const leftLengthBuffer = Buffer.alloc(4);
+  const rightLengthBuffer = Buffer.alloc(4);
+  leftBuffer.copy(leftPadded);
+  rightBuffer.copy(rightPadded);
+  leftLengthBuffer.writeUInt32BE(leftBuffer.length >>> 0);
+  rightLengthBuffer.writeUInt32BE(rightBuffer.length >>> 0);
+  const valuesMatch = timingSafeEqual(leftPadded, rightPadded);
+  const lengthsMatch = timingSafeEqual(leftLengthBuffer, rightLengthBuffer);
+  return Boolean(Number(valuesMatch) & Number(lengthsMatch));
+};
 
 const roomStore = new RoomStore(
   process.env.XSERVER_ROOMS_DB_PATH || DEFAULT_ROOMS_DB_PATH
@@ -204,7 +236,6 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
-          const existingRoom = roomStore.getRoom(sanitizedRoom);
           const activeRoom = activeRooms.get(sanitizedRoom);
           const password = String(data.password ?? '');
           if (activeRoom && activeRoom.host.readyState === WebSocket.OPEN) {
@@ -215,11 +246,12 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
-          if (existingRoom && existingRoom.password !== password) {
+          const existingRoom = roomStore.getRoom(sanitizedRoom);
+          if (existingRoom && !safeStringEquals(existingRoom.password, password)) {
             log.warn(
               `Client ${myClientId} attempted to create room with invalid credentials: "${sanitizedRoom}"`
             );
-            ws.send(JSON.stringify({ type: 'error', message: 'Room already exists.' }));
+            ws.send(JSON.stringify({ type: 'error', message: 'Unable to create room.' }));
             return;
           }
 
@@ -262,7 +294,10 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
-          if (targetRoomRecord.password && targetRoomRecord.password !== data.password) {
+          if (
+            targetRoomRecord.password &&
+            !safeStringEquals(targetRoomRecord.password, data.password)
+          ) {
             log.warn(
               `Client ${myClientId} failed authentication for room: "${sanitizedRoom}"`
             );
