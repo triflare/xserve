@@ -301,7 +301,7 @@ class tfXserve {
     return this._publicRoomsCache.join(', ');
   }
 
-  _clearPendingPublicRoomsRequest(resolveWithCache) {
+  _clearPendingPublicRoomsRequest(shouldResolveWithCache) {
     if (this._publicRoomsTimeout) {
       clearTimeout(this._publicRoomsTimeout);
       this._publicRoomsTimeout = null;
@@ -309,7 +309,7 @@ class tfXserve {
     const pendingResolve = this._publicRoomsResolve;
     this._publicRoomsResolve = null;
     this._publicRoomsInFlightPromise = null;
-    if (resolveWithCache && pendingResolve) {
+    if (shouldResolveWithCache && pendingResolve) {
       pendingResolve(this._formatPublicRooms());
     }
   }

@@ -249,7 +249,7 @@ describe('Xserve extension', () => {
     assert.equal(ws.sentMessages.length, 0);
   });
 
-  it('reuses in-flight getPublicRooms request and resolves pending request on close', async () => {
+  it('debounces concurrent getPublicRooms requests and resolves pending request on close', async () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
 

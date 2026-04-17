@@ -288,7 +288,8 @@ wss.on('connection', (ws, req) => {
         case 'delete_room': {
           if (isHost && currentRoom && rooms[currentRoom]) {
             let evictedCount = 0;
-            rooms[currentRoom].clients.forEach(clientWs => {
+            const clientsToEvict = Array.from(rooms[currentRoom].clients.values());
+            clientsToEvict.forEach(clientWs => {
               if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(
                   JSON.stringify({
@@ -338,7 +339,8 @@ wss.on('connection', (ws, req) => {
       if (isHost) {
         // Host left: Kick all clients and destroy the room
         let evictedCount = 0;
-        rooms[currentRoom].clients.forEach((clientWs, _id) => {
+        const clientsToEvict = Array.from(rooms[currentRoom].clients.values());
+        clientsToEvict.forEach(clientWs => {
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(
               JSON.stringify({
