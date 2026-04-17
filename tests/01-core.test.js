@@ -2,7 +2,7 @@
  * Unit tests for src/01-core.js — Xserve Scratch extension
  */
 
-import { describe, it, before, beforeEach, after } from 'node:test';
+import { describe, it, before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { installScratchMock } from './helpers/mock-scratch.js';
 
@@ -75,9 +75,16 @@ function clearExtensionState() {
   extension._messageQueue = [];
   extension._clientEventQueue = [];
   extension._currentActionResolve = null;
+  extension._publicRoomsCache = [];
+  extension._publicRoomsInFlightPromise = null;
+  extension._publicRoomsLastFetchAt = 0;
   if (extension._actionTimeout) {
     clearTimeout(extension._actionTimeout);
     extension._actionTimeout = null;
+  }
+  if (extension._publicRoomsTimeout) {
+    clearTimeout(extension._publicRoomsTimeout);
+    extension._publicRoomsTimeout = null;
   }
 }
 
@@ -88,6 +95,10 @@ describe('Xserve extension', () => {
 
   beforeEach(() => {
     MockWebSocket.instances.length = 0;
+    clearExtensionState();
+  });
+
+  afterEach(() => {
     clearExtensionState();
   });
 
@@ -103,6 +114,7 @@ describe('Xserve extension', () => {
     assert.ok(Array.isArray(info.blocks));
     assert.ok(info.blocks.length > 0);
     assert.ok(info.menus.CLIENT_EVENTS.items.some(item => item.value === 'joined'));
+    assert.ok(info.blocks.some(block => block.opcode === 'deleteServer'));
   });
 
   it('connectToServer resolves when WebSocket opens', async () => {
@@ -127,12 +139,17 @@ describe('Xserve extension', () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
 
-    const result = extension.createRoom({ ROOM: 'myRoom', PASS: 'secret' });
+    const result = extension.createRoom({
+      ROOM: 'myRoom',
+      PASS: 'secret',
+      VISIBILITY: 'public',
+    });
     assert.equal(ws.sentMessages.length, 1);
     const payload = JSON.parse(ws.sentMessages[0]);
     assert.equal(payload.type, 'create');
     assert.equal(payload.room, 'myRoom');
     assert.equal(payload.password, 'secret');
+    assert.equal(payload.public, true);
 
     ws.onmessage({ data: JSON.stringify({ type: 'created', room: 'myRoom' }) });
     await result;
@@ -140,6 +157,40 @@ describe('Xserve extension', () => {
     assert.equal(extension.connected, true);
     assert.equal(extension.isHost, true);
     assert.equal(extension.currentRoom, 'myRoom');
+  });
+
+  it('sends private and default room create payloads as non-public', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const privateResult = extension.createRoom({
+      ROOM: 'privateRoom',
+      PASS: 'secret',
+      VISIBILITY: 'private',
+    });
+    assert.equal(ws.sentMessages.length, 1);
+    let payload = JSON.parse(ws.sentMessages[0]);
+    assert.equal(payload.type, 'create');
+    assert.equal(payload.room, 'privateRoom');
+    assert.equal(payload.password, 'secret');
+    assert.equal(payload.public, false);
+
+    ws.onmessage({ data: JSON.stringify({ type: 'created', room: 'privateRoom' }) });
+    await privateResult;
+
+    const defaultResult = extension.createRoom({
+      ROOM: 'defaultRoom',
+      PASS: 'secret',
+    });
+    assert.equal(ws.sentMessages.length, 2);
+    payload = JSON.parse(ws.sentMessages[1]);
+    assert.equal(payload.type, 'create');
+    assert.equal(payload.room, 'defaultRoom');
+    assert.equal(payload.password, 'secret');
+    assert.equal(payload.public, false);
+
+    ws.onmessage({ data: JSON.stringify({ type: 'created', room: 'defaultRoom' }) });
+    await defaultResult;
   });
 
   it('joins a room and updates client state when received joined response', async () => {
@@ -198,7 +249,9 @@ describe('Xserve extension', () => {
     extension.isHost = true;
     extension.sendToClient({ ID: '1', DATA: 'hello' });
     extension.broadcast({ DATA: 'everyone' });
-    assert.equal(ws.sentMessages.length, 3);
+    extension.kickClient({ ID: '1' });
+    extension.deleteServer();
+    assert.equal(ws.sentMessages.length, 5);
     assert.deepEqual(JSON.parse(ws.sentMessages[1]), {
       type: 'send_to_client',
       target: '1',
@@ -208,6 +261,54 @@ describe('Xserve extension', () => {
       type: 'broadcast',
       data: 'everyone',
     });
+    assert.deepEqual(JSON.parse(ws.sentMessages[3]), {
+      type: 'kick',
+      target: '1',
+    });
+    assert.deepEqual(JSON.parse(ws.sentMessages[4]), {
+      type: 'delete_room',
+    });
+  });
+
+  it('fetches public room names from the server', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const pending = extension.getPublicRooms();
+    assert.deepEqual(JSON.parse(ws.sentMessages[0]), { type: 'fetch_rooms' });
+    ws.onmessage({ data: JSON.stringify({ type: 'rooms_list', rooms: ['lobby', 'openroom'] }) });
+
+    const result = await pending;
+    assert.equal(result, 'lobby, openroom');
+
+    ws.sentMessages.length = 0;
+    const cached = extension.getPublicRooms();
+    assert.equal(cached, 'lobby, openroom');
+    assert.equal(ws.sentMessages.length, 0);
+  });
+
+  it('debounces concurrent getPublicRooms requests and resolves pending request on close', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const pendingA = extension.getPublicRooms();
+    const pendingB = extension.getPublicRooms();
+    assert.equal(pendingA, pendingB);
+    assert.equal(ws.sentMessages.length, 1);
+    assert.deepEqual(JSON.parse(ws.sentMessages[0]), { type: 'fetch_rooms' });
+
+    ws.close();
+    const result = await pendingA;
+    assert.equal(result, '');
+    assert.equal(extension._publicRoomsInFlightPromise, null);
+  });
+
+  it('clears host room state when room_deleted is received', () => {
+    extension.isHost = true;
+    extension.currentRoom = 'myRoom';
+    extension._handleMessage(JSON.stringify({ type: 'room_deleted', room: 'myRoom' }));
+    assert.equal(extension.isHost, false);
+    assert.equal(extension.currentRoom, '');
   });
 
   it('downloads the server asset to the expected filename', () => {
