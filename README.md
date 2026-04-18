@@ -22,6 +22,9 @@ Xserve is a simple server architecture, designed for multi-player games or somet
 - **Based on Mint:** Xserve uses the Mint developent toolchain, so it'll be rock-hard and stable in the future.
 - **Ease of use:** To start a server, just connect to an Xserver by URL, and create your server with a name & password.
 - **Star topology:** As all good things should be, Xserve servers have star topologies. There is one host and many clients.
+- **Operational quick checks:** Xserver now exposes `GET /health` and `GET /stats` for uptime/room visibility.
+- **Auto cleanup:** Offline rooms are removed automatically if no host comes back within 5 minutes.
+- **Live room count in Scratch:** The extension includes a `room user count` reporter block powered by `get_room_info`.
 
 ## Documentation
 

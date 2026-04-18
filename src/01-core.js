@@ -5,6 +5,7 @@ if (!Scratch.extensions.unsandboxed) {
 const HEARTBEAT_INTERVAL_MS = 30000;
 const PUBLIC_ROOMS_TIMEOUT_MS = 3000;
 const PUBLIC_ROOMS_REFRESH_MS = 5000;
+const ROOM_INFO_TIMEOUT_MS = 3000;
 
 class tfXserve {
   constructor() {
@@ -28,6 +29,10 @@ class tfXserve {
     this._publicRoomsTimeout = null;
     this._publicRoomsInFlightPromise = null;
     this._publicRoomsLastFetchAt = 0;
+    this._roomInfoCache = { clientCount: 0, isHost: false };
+    this._roomInfoResolve = null;
+    this._roomInfoTimeout = null;
+    this._roomInfoInFlightPromise = null;
     this._heartbeatInterval = null;
   }
 
@@ -106,6 +111,11 @@ class tfXserve {
           opcode: 'getPublicRooms',
           blockType: Scratch.BlockType.REPORTER,
           text: Scratch.translate('public servers'),
+        },
+        {
+          opcode: 'getRoomUserCount',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('room user count'),
         },
         '---',
         {
@@ -257,6 +267,24 @@ class tfXserve {
         return;
       }
 
+      if (msg.type === 'room_info') {
+        const parsedCount = Number(msg.clientCount);
+        this._roomInfoCache = {
+          clientCount: Number.isFinite(parsedCount) ? Math.max(0, parsedCount) : 0,
+          isHost: Boolean(msg.isHost),
+        };
+        if (this._roomInfoResolve) {
+          this._roomInfoResolve(this._roomInfoCache.clientCount);
+          this._roomInfoResolve = null;
+        }
+        if (this._roomInfoTimeout) {
+          clearTimeout(this._roomInfoTimeout);
+          this._roomInfoTimeout = null;
+        }
+        this._roomInfoInFlightPromise = null;
+        return;
+      }
+
       if (msg.type === 'kicked') {
         console.warn('Xserve: You were removed from the room by the host.');
         if (this.ws) {
@@ -313,6 +341,19 @@ class tfXserve {
     this._publicRoomsInFlightPromise = null;
     if (shouldResolveWithCache && pendingResolve) {
       pendingResolve(this._formatPublicRooms());
+    }
+  }
+
+  _clearPendingRoomInfoRequest(shouldResolveWithCache) {
+    if (this._roomInfoTimeout) {
+      clearTimeout(this._roomInfoTimeout);
+      this._roomInfoTimeout = null;
+    }
+    const pendingResolve = this._roomInfoResolve;
+    this._roomInfoResolve = null;
+    this._roomInfoInFlightPromise = null;
+    if (shouldResolveWithCache && pendingResolve) {
+      pendingResolve(this._roomInfoCache.clientCount);
     }
   }
 
@@ -387,6 +428,7 @@ class tfXserve {
         if (this.ws !== socket) return;
         this._stopHeartbeat();
         this._clearPendingPublicRoomsRequest(true);
+        this._clearPendingRoomInfoRequest(true);
         this.connected = false;
         this.isHost = false;
         this.currentRoom = '';
@@ -409,6 +451,7 @@ class tfXserve {
   disconnect() {
     this._stopHeartbeat();
     this._clearPendingPublicRoomsRequest(true);
+    this._clearPendingRoomInfoRequest(true);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -485,6 +528,31 @@ class tfXserve {
       this.ws.send(JSON.stringify({ type: 'fetch_rooms' }));
     });
     return this._publicRoomsInFlightPromise;
+  }
+
+  getRoomUserCount() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return this._roomInfoCache.clientCount;
+    }
+    if (this._roomInfoInFlightPromise) {
+      return this._roomInfoInFlightPromise;
+    }
+
+    this._roomInfoInFlightPromise = new Promise(resolve => {
+      this._roomInfoResolve = resolve;
+      this._roomInfoTimeout = setTimeout(() => {
+        if (this._roomInfoResolve) {
+          this._roomInfoResolve(this._roomInfoCache.clientCount);
+          this._roomInfoResolve = null;
+        }
+        this._roomInfoInFlightPromise = null;
+        this._roomInfoTimeout = null;
+      }, ROOM_INFO_TIMEOUT_MS);
+
+      this.ws.send(JSON.stringify({ type: 'get_room_info' }));
+    });
+
+    return this._roomInfoInFlightPromise;
   }
 
   whenMessageReceived() {

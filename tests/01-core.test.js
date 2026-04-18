@@ -78,6 +78,8 @@ function clearExtensionState() {
   extension._publicRoomsCache = [];
   extension._publicRoomsInFlightPromise = null;
   extension._publicRoomsLastFetchAt = 0;
+  extension._roomInfoCache = { clientCount: 0, isHost: false };
+  extension._roomInfoInFlightPromise = null;
   if (extension._actionTimeout) {
     clearTimeout(extension._actionTimeout);
     extension._actionTimeout = null;
@@ -85,6 +87,10 @@ function clearExtensionState() {
   if (extension._publicRoomsTimeout) {
     clearTimeout(extension._publicRoomsTimeout);
     extension._publicRoomsTimeout = null;
+  }
+  if (extension._roomInfoTimeout) {
+    clearTimeout(extension._roomInfoTimeout);
+    extension._roomInfoTimeout = null;
   }
 }
 
@@ -115,6 +121,7 @@ describe('Xserve extension', () => {
     assert.ok(info.blocks.length > 0);
     assert.ok(info.menus.CLIENT_EVENTS.items.some(item => item.value === 'joined'));
     assert.ok(info.blocks.some(block => block.opcode === 'deleteServer'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getRoomUserCount'));
   });
 
   it('connectToServer resolves when WebSocket opens', async () => {
@@ -301,6 +308,36 @@ describe('Xserve extension', () => {
     const result = await pendingA;
     assert.equal(result, '');
     assert.equal(extension._publicRoomsInFlightPromise, null);
+  });
+
+  it('fetches room user count from the server', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const pending = extension.getRoomUserCount();
+    assert.deepEqual(JSON.parse(ws.sentMessages[0]), { type: 'get_room_info' });
+    ws.onmessage({ data: JSON.stringify({ type: 'room_info', clientCount: 3, isHost: false }) });
+
+    const result = await pending;
+    assert.equal(result, 3);
+    assert.equal(extension._roomInfoCache.clientCount, 3);
+    assert.equal(extension._roomInfoCache.isHost, false);
+  });
+
+  it('debounces concurrent getRoomUserCount requests and resolves pending request on close', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const pendingA = extension.getRoomUserCount();
+    const pendingB = extension.getRoomUserCount();
+    assert.equal(pendingA, pendingB);
+    assert.equal(ws.sentMessages.length, 1);
+    assert.deepEqual(JSON.parse(ws.sentMessages[0]), { type: 'get_room_info' });
+
+    ws.close();
+    const result = await pendingA;
+    assert.equal(result, 0);
+    assert.equal(extension._roomInfoInFlightPromise, null);
   });
 
   it('clears host room state when room_deleted is received', () => {
