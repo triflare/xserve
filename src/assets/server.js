@@ -16,6 +16,7 @@ const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_MESSAGES_PER_SECOND = 10;
 const RATE_LIMIT_COOLDOWN_MS = 1000;
 const ROOM_EXPIRY_MS = 5 * 60 * 1000;
+const HTTP_ADMIN_TOKEN = String(process.env.XSERVER_ADMIN_TOKEN ?? '');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ROOMS_DB_PATH = path.resolve(__dirname, '../../xserver-rooms.json');
 
@@ -197,12 +198,22 @@ const scheduleRoomExpiry = roomName => {
   clearRoomExpiry(roomName);
   const expiresAt = Date.now() + ROOM_EXPIRY_MS;
   const timeout = setTimeout(() => {
-    roomExpiryTimers.delete(roomName);
-    if (activeRooms.has(roomName)) return;
-    if (!roomStore.getRoom(roomName)) return;
-    roomStore.deleteRoom(roomName);
-    roomMessageVolume.delete(roomName);
-    log.info(`Room expired after host inactivity | Room: "${roomName}"`);
+    try {
+      roomExpiryTimers.delete(roomName);
+      if (activeRooms.has(roomName)) return;
+      if (!roomStore.getRoom(roomName)) return;
+      roomStore.deleteRoom(roomName);
+      roomMessageVolume.delete(roomName);
+      log.info(`Room expired after host inactivity | Room: "${roomName}"`);
+    } catch (error) {
+      const safeErrorMessage = String(error?.message ?? 'Unknown error')
+        .replace(/[\r\n]/g, '')
+        .replace(/[^\x20-\x7E]/g, '')
+        .slice(0, 200);
+      log.error(
+        `Failed room expiry cleanup | Room: "${roomName}" | Error: ${safeErrorMessage}`
+      );
+    }
   }, ROOM_EXPIRY_MS);
   roomExpiryTimers.set(roomName, { timeout, expiresAt });
   log.info(`Scheduled room expiry | Room: "${roomName}" | In: ${ROOM_EXPIRY_MS}ms`);
@@ -214,7 +225,13 @@ const recordRoomMessage = (roomName, count = 1) => {
   roomMessageVolume.set(roomName, currentCount + count);
 };
 
-const getStatsPayload = () => ({
+const isRoomPublic = roomName => {
+  const roomRecord = roomStore.getRoom(roomName);
+  if (!roomRecord) return false;
+  return !roomRecord.password || roomRecord.isPublic;
+};
+
+const getStatsPayload = (includeSensitiveDetails = false) => ({
   uptimeSeconds: Math.floor((Date.now() - serverStats.startedAt) / 1000),
   activeRooms: activeRooms.size,
   activeConnections: serverStats.activeConnections,
@@ -222,16 +239,34 @@ const getStatsPayload = () => ({
   totalMessagesReceived: serverStats.totalMessagesReceived,
   totalMessagesRouted: serverStats.totalMessagesRouted,
   rooms: Array.from(activeRooms.entries()).map(([roomName, room]) => ({
-    room: roomName,
+    room: includeSensitiveDetails || isRoomPublic(roomName) ? roomName : '',
+    isPublic: isRoomPublic(roomName),
     clientCount: room.clients.size + 1,
     isOnline: room.host.readyState === WebSocket.OPEN,
     messageVolume: roomMessageVolume.get(roomName) || 0,
   })),
   expiringRooms: Array.from(roomExpiryTimers.entries()).map(([roomName, timerEntry]) => ({
-    room: roomName,
+    room: includeSensitiveDetails || isRoomPublic(roomName) ? roomName : '',
     expiresInMs: Math.max(0, timerEntry.expiresAt - Date.now()),
   })),
 });
+
+const extractAuthToken = req => {
+  const headerToken = String(req.headers['x-xserve-admin-token'] ?? '').trim();
+  if (headerToken) return headerToken;
+  const authorization = String(req.headers.authorization ?? '').trim();
+  if (authorization.toLowerCase().startsWith('bearer ')) {
+    return authorization.slice(7).trim();
+  }
+  return '';
+};
+
+const hasValidAdminToken = req => {
+  if (!HTTP_ADMIN_TOKEN) return false;
+  const providedToken = extractAuthToken(req);
+  if (!providedToken) return false;
+  return safeStringEquals(providedToken, HTTP_ADMIN_TOKEN);
+};
 
 const httpServer = createServer((req, res) => {
   const requestUrl = new URL(req.url || '/', 'http://localhost');
@@ -244,8 +279,14 @@ const httpServer = createServer((req, res) => {
   }
 
   if (req.method === 'GET' && requestUrl.pathname === '/stats') {
+    const includeSensitiveDetails = hasValidAdminToken(req);
+    if (HTTP_ADMIN_TOKEN && !includeSensitiveDetails) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(getStatsPayload()));
+    res.end(JSON.stringify(getStatsPayload(includeSensitiveDetails)));
     return;
   }
 

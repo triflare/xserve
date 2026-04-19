@@ -49,6 +49,10 @@ const { mock, restore } = installScratchMock();
 mock.extensions.unsandboxed = true;
 mock.Cast = { toString: value => String(value) };
 mock.canFetch = async () => true;
+mock.fetch = async () => ({
+  ok: true,
+  json: async () => ({ status: 'ok' }),
+});
 mock.download = (data, filename) => {
   mock.lastDownload = { data, filename };
 };
@@ -80,6 +84,9 @@ function clearExtensionState() {
   extension._publicRoomsLastFetchAt = 0;
   extension._roomInfoCache = { clientCount: 0, isHost: false };
   extension._roomInfoInFlightPromise = null;
+  extension._serverBaseUrl = '';
+  extension._serverAdminToken = '';
+  extension._serverStatsCache = '{}';
   if (extension._actionTimeout) {
     clearTimeout(extension._actionTimeout);
     extension._actionTimeout = null;
@@ -122,6 +129,9 @@ describe('Xserve extension', () => {
     assert.ok(info.menus.CLIENT_EVENTS.items.some(item => item.value === 'joined'));
     assert.ok(info.blocks.some(block => block.opcode === 'deleteServer'));
     assert.ok(info.blocks.some(block => block.opcode === 'getRoomUserCount'));
+    assert.ok(info.blocks.some(block => block.opcode === 'setServerAdminToken'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getServerHealth'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getServerStats'));
   });
 
   it('connectToServer resolves when WebSocket opens', async () => {
@@ -351,5 +361,44 @@ describe('Xserve extension', () => {
   it('downloads the server asset to the expected filename', () => {
     extension.downloadServerSoftware();
     assert.deepEqual(mock.lastDownload, { data: undefined, filename: 'xserver.js' });
+  });
+
+  it('sets the server admin token for stats requests', () => {
+    extension.setServerAdminToken({ TOKEN: 'abc123' });
+    assert.equal(extension._serverAdminToken, 'abc123');
+  });
+
+  it('fetches server health status from the HTTP endpoint', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    let fetchEndpoint = '';
+    mock.fetch = async endpoint => {
+      fetchEndpoint = endpoint;
+      return {
+        ok: true,
+        json: async () => ({ status: 'ok' }),
+      };
+    };
+
+    const status = await extension.getServerHealth();
+    assert.equal(status, 'ok');
+    assert.equal(fetchEndpoint, 'https://example.com/health');
+  });
+
+  it('fetches server stats and sends admin token header when set', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    extension.setServerAdminToken({ TOKEN: 'secret-token' });
+
+    let requestHeaders = null;
+    mock.fetch = async (_endpoint, options) => {
+      requestHeaders = options?.headers || {};
+      return {
+        ok: true,
+        json: async () => ({ activeRooms: 2 }),
+      };
+    };
+
+    const stats = await extension.getServerStats();
+    assert.equal(stats, '{"activeRooms":2}');
+    assert.equal(requestHeaders['x-xserve-admin-token'], 'secret-token');
   });
 });
