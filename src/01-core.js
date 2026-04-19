@@ -439,6 +439,10 @@ class tfXserve {
     }
   }
 
+  _setLastError(message) {
+    this._lastError = Scratch.Cast.toString(message).replace(/[\r\n]/g, '');
+  }
+
   async _fetchServerEndpoint(pathname) {
     if (!this._serverBaseUrl) {
       return null;
@@ -603,6 +607,14 @@ class tfXserve {
     return this.isHost;
   }
   getMyId() {
+    if (!this.connected) {
+      this._setLastError('Not connected to a server.');
+      return '';
+    }
+    if (this.isHost) {
+      this._setLastError('Hosts do not have a client ID.');
+      return '';
+    }
     return this.myId;
   }
   getLastMessage() {
@@ -762,13 +774,19 @@ class tfXserve {
   }
 
   deleteServer() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.isHost) {
-      this.ws.send(
-        JSON.stringify({
-          type: 'delete_room',
-        })
-      );
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this._setLastError('Not connected to a server.');
+      return;
     }
+    if (!this.isHost) {
+      this._setLastError('Only the host can delete a server.');
+      return;
+    }
+    this.ws.send(
+      JSON.stringify({
+        type: 'delete_room',
+      })
+    );
   }
 
   downloadServerSoftware() {

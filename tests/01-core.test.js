@@ -298,6 +298,24 @@ describe('Xserve extension', () => {
     });
   });
 
+  it('reports errors for invalid getMyId and deleteServer usage', async () => {
+    assert.equal(extension.getMyId(), '');
+    assert.equal(extension.getLastError(), 'Not connected to a server.');
+
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    extension.connected = true;
+    extension.isHost = true;
+    assert.equal(extension.getMyId(), '');
+    assert.equal(extension.getLastError(), 'Hosts do not have a client ID.');
+
+    extension.isHost = false;
+    extension.deleteServer();
+    assert.equal(extension.getLastError(), 'Only the host can delete a server.');
+    assert.equal(ws.sentMessages.some(msg => JSON.parse(msg).type === 'delete_room'), false);
+  });
+
   it('fetches public room names from the server', async () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
