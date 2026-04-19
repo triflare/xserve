@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
 
 const PORT = process.env.PORT || 8080;
+const XSERVER_VERSION = '2.0.0';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_MESSAGES_PER_SECOND = 10;
 const RATE_LIMIT_COOLDOWN_MS = 1000;
@@ -288,7 +289,10 @@ const httpServer = createServer((req, res) => {
 
   if (req.method === 'GET' && requestUrl.pathname === '/health') {
     const isHealthy = httpServer.listening;
-    sendJson(isHealthy ? 200 : 503, { status: isHealthy ? 'ok' : 'not_ready' });
+    sendJson(isHealthy ? 200 : 503, {
+      status: isHealthy ? 'ok' : 'not_ready',
+      version: XSERVER_VERSION,
+    });
     return;
   }
 
@@ -329,6 +333,21 @@ const parsePublicFlag = value =>
     .toLowerCase() === 'true';
 
 wss.on('connection', (ws, req) => {
+  const connectionUrl = new URL(req.url || '/', 'http://localhost');
+  const clientVersion = String(
+    connectionUrl.searchParams.get('xserveVersion') ?? ''
+  ).trim();
+  if (!safeStringEquals(clientVersion, XSERVER_VERSION)) {
+    ws.send(
+      JSON.stringify({
+        type: 'error',
+        message: `Version mismatch. Expected ${XSERVER_VERSION}.`,
+      })
+    );
+    ws.close();
+    return;
+  }
+
   let currentRoom = null;
   let isHost = false;
   const myClientId = nextClientId++;

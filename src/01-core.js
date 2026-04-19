@@ -7,6 +7,7 @@ const PUBLIC_ROOMS_TIMEOUT_MS = 3000;
 const PUBLIC_ROOMS_REFRESH_MS = 5000;
 const ROOM_INFO_TIMEOUT_MS = 3000;
 const SERVER_INFO_FALLBACK = Scratch.translate('unavailable');
+const XSERVE_VERSION = '2.0.0';
 
 class tfXserve {
   constructor() {
@@ -38,6 +39,7 @@ class tfXserve {
     this._serverAdminToken = '';
     this._serverStatsCache = '{}';
     this._heartbeatInterval = null;
+    this._lastError = '';
   }
 
   getInfo() {
@@ -138,9 +140,19 @@ class tfXserve {
           text: Scratch.translate('server stats'),
         },
         {
+          opcode: 'getXserveVersion',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('Xserve + Xserver version'),
+        },
+        {
           opcode: 'getRoomUserCount',
           blockType: Scratch.BlockType.REPORTER,
           text: Scratch.translate('room client count'),
+        },
+        {
+          opcode: 'getLastError',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('last error'),
         },
         '---',
         {
@@ -258,6 +270,7 @@ class tfXserve {
             /[\r\n]/g,
             ''
           );
+          this._lastError = safeErrorMessage;
           console.error('Xserve Error:', safeErrorMessage);
         }
 
@@ -416,6 +429,16 @@ class tfXserve {
     }
   }
 
+  _withVersionParam(rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      parsed.searchParams.set('xserveVersion', XSERVE_VERSION);
+      return parsed.toString();
+    } catch {
+      return rawUrl;
+    }
+  }
+
   async _fetchServerEndpoint(pathname) {
     if (!this._serverBaseUrl) {
       return null;
@@ -473,9 +496,12 @@ class tfXserve {
       this.ws.close();
     }
 
-    const url = Scratch.Cast.toString(args.URL);
+    this._lastError = '';
+    const rawUrl = Scratch.Cast.toString(args.URL);
+    const url = this._withVersionParam(rawUrl);
     this._serverBaseUrl = this._deriveServerBaseUrl(url);
     if (!(await Scratch.canFetch(url))) {
+      this._lastError = 'Cannot fetch URL';
       console.error('Xserve: Cannot fetch URL', url);
       return;
     }
@@ -486,6 +512,7 @@ class tfXserve {
         // eslint-disable-next-line turbowarp/check-can-fetch
         socket = new WebSocket(url);
       } catch (e) {
+        this._lastError = 'Invalid URL';
         console.error('Xserve: Invalid URL', e);
         resolve();
         return;
@@ -518,6 +545,7 @@ class tfXserve {
 
       socket.onerror = () => {
         if (this.ws !== socket) return;
+        this._lastError = 'Connection failed';
         console.error('Xserve: Connection failed');
         resolve();
       };
@@ -629,6 +657,16 @@ class tfXserve {
     } catch {
       return this._serverStatsCache;
     }
+  }
+
+  async getXserveVersion() {
+    const payload = await this._fetchServerEndpoint('/health');
+    const serverVersion = Scratch.Cast.toString(payload?.version || SERVER_INFO_FALLBACK);
+    return `${XSERVE_VERSION} + ${serverVersion}`;
+  }
+
+  getLastError() {
+    return this._lastError;
   }
 
   getRoomUserCount() {

@@ -88,6 +88,7 @@ function clearExtensionState() {
   extension._serverBaseUrl = '';
   extension._serverAdminToken = '';
   extension._serverStatsCache = '{}';
+  extension._lastError = '';
   if (extension._actionTimeout) {
     clearTimeout(extension._actionTimeout);
     extension._actionTimeout = null;
@@ -133,13 +134,15 @@ describe('Xserve extension', () => {
     assert.ok(info.blocks.some(block => block.opcode === 'setServerAdminToken'));
     assert.ok(info.blocks.some(block => block.opcode === 'getServerHealth'));
     assert.ok(info.blocks.some(block => block.opcode === 'getServerStats'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getXserveVersion'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getLastError'));
   });
 
   it('connectToServer resolves when WebSocket opens', async () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
     assert.ok(ws, 'WebSocket instance should be created');
-    assert.equal(ws.url, 'wss://example.com');
+    assert.equal(ws.url, 'wss://example.com/?xserveVersion=2.0.0');
     assert.equal(extension.connected, false);
   });
 
@@ -237,6 +240,13 @@ describe('Xserve extension', () => {
     assert.equal(extension.lastSender, '42');
     assert.equal(extension.whenMessageReceived(), true);
     assert.equal(extension.whenMessageReceived(), false);
+  });
+
+  it('stores server error messages for last error reporter', () => {
+    extension._handleMessage(
+      JSON.stringify({ type: 'error', message: 'Version mismatch. Expected 2.0.0.' })
+    );
+    assert.equal(extension.getLastError(), 'Version mismatch. Expected 2.0.0.');
   });
 
   it('handles client join and leave events and whenClientEvent matching', () => {
@@ -405,5 +415,17 @@ describe('Xserve extension', () => {
     const stats = await extension.getServerStats();
     assert.equal(stats, '{"activeRooms":2}');
     assert.equal(requestHeaders['x-xserve-admin-token'], 'secret-token');
+  });
+
+  it('reports extension and server versions', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    mock.fetch = () =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ status: 'ok', version: '2.0.0' }),
+      });
+
+    const versions = await extension.getXserveVersion();
+    assert.equal(versions, '2.0.0 + 2.0.0');
   });
 });
