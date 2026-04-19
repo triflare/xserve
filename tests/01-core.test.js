@@ -298,19 +298,33 @@ describe('Xserve extension', () => {
     });
   });
 
-  it('reports errors for invalid getMyId and deleteServer usage', async () => {
+  it('reports an error when getMyId is called while disconnected', () => {
     assert.equal(extension.getMyId(), '');
     assert.equal(extension.getLastError(), 'Not connected to a server.');
+  });
 
+  it('reports an error when getMyId is called by a host', async () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
+    const createResult = extension.createRoom({
+      ROOM: 'hostRoom',
+      PASS: 'secret',
+      VISIBILITY: 'private',
+    });
+    ws.onmessage({ data: JSON.stringify({ type: 'created', room: 'hostRoom' }) });
+    await createResult;
 
-    extension.connected = true;
-    extension.isHost = true;
     assert.equal(extension.getMyId(), '');
     assert.equal(extension.getLastError(), 'Hosts do not have a client ID.');
+  });
 
-    extension.isHost = false;
+  it('reports an error when deleteServer is called by a non-host client', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+    const joinResult = extension.joinRoom({ ROOM: 'clientRoom', PASS: 'secret' });
+    ws.onmessage({ data: JSON.stringify({ type: 'joined', room: 'clientRoom', id: '11' }) });
+    await joinResult;
+
     extension.deleteServer();
     assert.equal(extension.getLastError(), 'Only the host can delete a server.');
     assert.equal(ws.sentMessages.some(msg => JSON.parse(msg).type === 'delete_room'), false);
