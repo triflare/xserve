@@ -48,7 +48,12 @@ globalThis.WebSocket = MockWebSocket;
 const { mock, restore } = installScratchMock();
 mock.extensions.unsandboxed = true;
 mock.Cast = { toString: value => String(value) };
-mock.canFetch = async () => true;
+mock.canFetch = () => Promise.resolve(true);
+mock.fetch = () =>
+  Promise.resolve({
+    ok: true,
+    json: () => Promise.resolve({ status: 'ok' }),
+  });
 mock.download = (data, filename) => {
   mock.lastDownload = { data, filename };
 };
@@ -78,6 +83,12 @@ function clearExtensionState() {
   extension._publicRoomsCache = [];
   extension._publicRoomsInFlightPromise = null;
   extension._publicRoomsLastFetchAt = 0;
+  extension._roomInfoCache = { clientCount: 0, isHost: false };
+  extension._roomInfoInFlightPromise = null;
+  extension._serverBaseUrl = '';
+  extension._serverAdminToken = '';
+  extension._serverStatsCache = '{}';
+  extension._lastError = '';
   if (extension._actionTimeout) {
     clearTimeout(extension._actionTimeout);
     extension._actionTimeout = null;
@@ -85,6 +96,10 @@ function clearExtensionState() {
   if (extension._publicRoomsTimeout) {
     clearTimeout(extension._publicRoomsTimeout);
     extension._publicRoomsTimeout = null;
+  }
+  if (extension._roomInfoTimeout) {
+    clearTimeout(extension._roomInfoTimeout);
+    extension._roomInfoTimeout = null;
   }
 }
 
@@ -115,13 +130,19 @@ describe('Xserve extension', () => {
     assert.ok(info.blocks.length > 0);
     assert.ok(info.menus.CLIENT_EVENTS.items.some(item => item.value === 'joined'));
     assert.ok(info.blocks.some(block => block.opcode === 'deleteServer'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getRoomUserCount'));
+    assert.ok(info.blocks.some(block => block.opcode === 'setServerAdminToken'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getServerHealth'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getServerStats'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getXserveVersion'));
+    assert.ok(info.blocks.some(block => block.opcode === 'getLastError'));
   });
 
   it('connectToServer resolves when WebSocket opens', async () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
     assert.ok(ws, 'WebSocket instance should be created');
-    assert.equal(ws.url, 'wss://example.com');
+    assert.equal(ws.url, 'wss://example.com/?xserveVersion=2.0.0');
     assert.equal(extension.connected, false);
   });
 
@@ -221,6 +242,13 @@ describe('Xserve extension', () => {
     assert.equal(extension.whenMessageReceived(), false);
   });
 
+  it('stores server error messages for last error reporter', () => {
+    extension._handleMessage(
+      JSON.stringify({ type: 'error', message: 'Version mismatch. Expected 2.0.0.' })
+    );
+    assert.equal(extension.getLastError(), 'Version mismatch. Expected 2.0.0.');
+  });
+
   it('handles client join and leave events and whenClientEvent matching', () => {
     extension._handleMessage(JSON.stringify({ type: 'client_joined', id: '42' }));
     assert.equal(extension.lastEventClient, '42');
@@ -270,6 +298,38 @@ describe('Xserve extension', () => {
     });
   });
 
+  it('reports an error when getMyId is called while disconnected', () => {
+    assert.equal(extension.getMyId(), '');
+    assert.equal(extension.getLastError(), 'Not connected to a server.');
+  });
+
+  it('reports an error when getMyId is called by a host', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+    const createResult = extension.createRoom({
+      ROOM: 'hostRoom',
+      PASS: 'secret',
+      VISIBILITY: 'private',
+    });
+    ws.onmessage({ data: JSON.stringify({ type: 'created', room: 'hostRoom' }) });
+    await createResult;
+
+    assert.equal(extension.getMyId(), '');
+    assert.equal(extension.getLastError(), 'Hosts do not have a client ID.');
+  });
+
+  it('reports an error when deleteServer is called by a non-host client', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+    const joinResult = extension.joinRoom({ ROOM: 'clientRoom', PASS: 'secret' });
+    ws.onmessage({ data: JSON.stringify({ type: 'joined', room: 'clientRoom', id: '11' }) });
+    await joinResult;
+
+    extension.deleteServer();
+    assert.equal(extension.getLastError(), 'Only the host can delete a server.');
+    assert.equal(ws.sentMessages.some(msg => JSON.parse(msg).type === 'delete_room'), false);
+  });
+
   it('fetches public room names from the server', async () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
@@ -279,11 +339,11 @@ describe('Xserve extension', () => {
     ws.onmessage({ data: JSON.stringify({ type: 'rooms_list', rooms: ['lobby', 'openroom'] }) });
 
     const result = await pending;
-    assert.equal(result, 'lobby, openroom');
+    assert.equal(result, JSON.stringify(['lobby', 'openroom']));
 
     ws.sentMessages.length = 0;
     const cached = extension.getPublicRooms();
-    assert.equal(cached, 'lobby, openroom');
+    assert.equal(cached, JSON.stringify(['lobby', 'openroom']));
     assert.equal(ws.sentMessages.length, 0);
   });
 
@@ -299,20 +359,105 @@ describe('Xserve extension', () => {
 
     ws.close();
     const result = await pendingA;
-    assert.equal(result, '');
+    assert.equal(result, JSON.stringify([]));
     assert.equal(extension._publicRoomsInFlightPromise, null);
+  });
+
+  it('fetches room user count from the server', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+
+    const pending = extension.getRoomUserCount();
+    assert.deepEqual(JSON.parse(ws.sentMessages[0]), { type: 'get_room_info' });
+    ws.onmessage({ data: JSON.stringify({ type: 'room_info', clientCount: 3, isHost: false }) });
+
+    const result = await pending;
+    assert.equal(result, 3);
+    assert.equal(extension._roomInfoCache.clientCount, 3);
+    assert.equal(extension._roomInfoCache.isHost, false);
+  });
+
+  it('debounces concurrent getRoomUserCount requests and resolves pending request on close', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    const ws = lastWs();
+    extension._roomInfoCache = { clientCount: 9, isHost: false };
+
+    const pendingA = extension.getRoomUserCount();
+    const pendingB = extension.getRoomUserCount();
+    assert.equal(pendingA, pendingB);
+    assert.equal(ws.sentMessages.length, 1);
+    assert.deepEqual(JSON.parse(ws.sentMessages[0]), { type: 'get_room_info' });
+
+    ws.close();
+    const result = await pendingA;
+    assert.equal(result, 0);
+    assert.equal(extension._roomInfoCache.clientCount, 0);
+    assert.equal(extension._roomInfoInFlightPromise, null);
   });
 
   it('clears host room state when room_deleted is received', () => {
     extension.isHost = true;
     extension.currentRoom = 'myRoom';
+    extension._roomInfoCache = { clientCount: 5, isHost: true };
     extension._handleMessage(JSON.stringify({ type: 'room_deleted', room: 'myRoom' }));
     assert.equal(extension.isHost, false);
     assert.equal(extension.currentRoom, '');
+    assert.equal(extension._roomInfoCache.clientCount, 0);
   });
 
   it('downloads the server asset to the expected filename', () => {
     extension.downloadServerSoftware();
     assert.deepEqual(mock.lastDownload, { data: undefined, filename: 'xserver.js' });
+  });
+
+  it('sets the server admin token for stats requests', () => {
+    extension.setServerAdminToken({ TOKEN: 'abc123' });
+    assert.equal(extension._serverAdminToken, 'abc123');
+  });
+
+  it('fetches server health status from the HTTP endpoint', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    let fetchEndpoint = '';
+    mock.fetch = endpoint => {
+      fetchEndpoint = endpoint;
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ status: 'ok' }),
+      });
+    };
+
+    const status = await extension.getServerHealth();
+    assert.equal(status, 'ok');
+    assert.equal(fetchEndpoint, 'https://example.com/health');
+  });
+
+  it('fetches server stats and sends admin token header when set', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    extension.setServerAdminToken({ TOKEN: 'secret-token' });
+
+    let requestHeaders = null;
+    mock.fetch = (_endpoint, options) => {
+      requestHeaders = options?.headers || {};
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ activeRooms: 2 }),
+      });
+    };
+
+    const stats = await extension.getServerStats();
+    assert.equal(stats, '{"activeRooms":2}');
+    assert.equal(requestHeaders['x-xserve-admin-token'], 'secret-token');
+  });
+
+  it('reports extension and server versions', async () => {
+    await extension.connectToServer({ URL: 'wss://example.com' });
+    mock.fetch = () =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ status: 'ok', version: '2.0.0' }),
+      });
+
+    const versions = await extension.getXserveVersion();
+    assert.equal(versions, '2.0.0 + 2.0.0');
   });
 });
