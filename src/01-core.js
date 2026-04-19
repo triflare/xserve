@@ -60,7 +60,7 @@ class tfXserve {
           arguments: {
             URL: {
               type: Scratch.ArgumentType.STRING,
-              defaultValue: 'wss://your-server-url',
+              defaultValue: 'wss://xserver.sdisk.us',
             },
           },
         },
@@ -72,7 +72,7 @@ class tfXserve {
         {
           opcode: 'setServerAdminToken',
           blockType: Scratch.BlockType.COMMAND,
-          text: Scratch.translate('set server admin token [TOKEN]'),
+          text: Scratch.translate('set server admin token to [TOKEN]'),
           arguments: {
             TOKEN: {
               type: Scratch.ArgumentType.STRING,
@@ -109,7 +109,7 @@ class tfXserve {
         {
           opcode: 'isConnected',
           blockType: Scratch.BlockType.BOOLEAN,
-          text: Scratch.translate('connected to a server?'),
+          text: Scratch.translate('am I connected to a server?'),
         },
         {
           opcode: 'amIHost',
@@ -125,7 +125,7 @@ class tfXserve {
         {
           opcode: 'getPublicRooms',
           blockType: Scratch.BlockType.REPORTER,
-          text: Scratch.translate('public servers JSON'),
+          text: Scratch.translate('public servers'),
         },
         {
           opcode: 'getServerHealth',
@@ -135,12 +135,12 @@ class tfXserve {
         {
           opcode: 'getServerStats',
           blockType: Scratch.BlockType.REPORTER,
-          text: Scratch.translate('server stats JSON'),
+          text: Scratch.translate('server stats'),
         },
         {
           opcode: 'getRoomUserCount',
           blockType: Scratch.BlockType.REPORTER,
-          text: Scratch.translate('room user count'),
+          text: Scratch.translate('room client count'),
         },
         '---',
         {
