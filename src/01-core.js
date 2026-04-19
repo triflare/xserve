@@ -125,7 +125,7 @@ class tfXserve {
         {
           opcode: 'getPublicRooms',
           blockType: Scratch.BlockType.REPORTER,
-          text: Scratch.translate('public servers'),
+          text: Scratch.translate('public servers JSON'),
         },
         {
           opcode: 'getServerHealth',
@@ -354,7 +354,11 @@ class tfXserve {
   }
 
   _formatPublicRooms() {
-    return this._publicRoomsCache.join(', ');
+    try {
+      return JSON.stringify(this._publicRoomsCache);
+    } catch {
+      return '[]';
+    }
   }
 
   _clearPendingPublicRoomsRequest(shouldResolveWithCache) {

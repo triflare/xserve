@@ -297,11 +297,11 @@ describe('Xserve extension', () => {
     ws.onmessage({ data: JSON.stringify({ type: 'rooms_list', rooms: ['lobby', 'openroom'] }) });
 
     const result = await pending;
-    assert.equal(result, 'lobby, openroom');
+    assert.equal(result, JSON.stringify(['lobby', 'openroom']));
 
     ws.sentMessages.length = 0;
     const cached = extension.getPublicRooms();
-    assert.equal(cached, 'lobby, openroom');
+    assert.equal(cached, JSON.stringify(['lobby', 'openroom']));
     assert.equal(ws.sentMessages.length, 0);
   });
 
@@ -317,7 +317,7 @@ describe('Xserve extension', () => {
 
     ws.close();
     const result = await pendingA;
-    assert.equal(result, '');
+    assert.equal(result, JSON.stringify([]));
     assert.equal(extension._publicRoomsInFlightPromise, null);
   });
 
