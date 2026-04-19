@@ -319,6 +319,7 @@ class tfXserve {
       }
 
       if (msg.type === 'room_deleted') {
+        this._roomInfoCache = { clientCount: 0, isHost: false };
         this.isHost = false;
         this.currentRoom = '';
         this.connected = false;
@@ -498,6 +499,7 @@ class tfXserve {
         if (this.ws !== socket) return;
         this._stopHeartbeat();
         this._clearPendingPublicRoomsRequest(true);
+        this._roomInfoCache = { clientCount: 0, isHost: false };
         this._clearPendingRoomInfoRequest(true);
         this.connected = false;
         this.isHost = false;

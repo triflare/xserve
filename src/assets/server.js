@@ -270,28 +270,39 @@ const hasValidAdminToken = req => {
 
 const httpServer = createServer((req, res) => {
   const requestUrl = new URL(req.url || '/', 'http://localhost');
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-xserve-admin-token',
+  };
+  const sendJson = (statusCode, body) => {
+    res.writeHead(statusCode, { ...corsHeaders, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders);
+    res.end();
+    return;
+  }
 
   if (req.method === 'GET' && requestUrl.pathname === '/health') {
     const isHealthy = httpServer.listening;
-    res.writeHead(isHealthy ? 200 : 503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: isHealthy ? 'ok' : 'not_ready' }));
+    sendJson(isHealthy ? 200 : 503, { status: isHealthy ? 'ok' : 'not_ready' });
     return;
   }
 
   if (req.method === 'GET' && requestUrl.pathname === '/stats') {
     const includeSensitiveDetails = hasValidAdminToken(req);
     if (HTTP_ADMIN_TOKEN && !includeSensitiveDetails) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      sendJson(401, { error: 'Unauthorized' });
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(getStatsPayload(includeSensitiveDetails)));
+    sendJson(200, getStatsPayload(includeSensitiveDetails));
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not found' }));
+  sendJson(404, { error: 'Not found' });
 });
 
 const wss = new WebSocketServer({ server: httpServer });

@@ -48,11 +48,12 @@ globalThis.WebSocket = MockWebSocket;
 const { mock, restore } = installScratchMock();
 mock.extensions.unsandboxed = true;
 mock.Cast = { toString: value => String(value) };
-mock.canFetch = async () => true;
-mock.fetch = async () => ({
-  ok: true,
-  json: async () => ({ status: 'ok' }),
-});
+mock.canFetch = () => Promise.resolve(true);
+mock.fetch = () =>
+  Promise.resolve({
+    ok: true,
+    json: () => Promise.resolve({ status: 'ok' }),
+  });
 mock.download = (data, filename) => {
   mock.lastDownload = { data, filename };
 };
@@ -337,6 +338,7 @@ describe('Xserve extension', () => {
   it('debounces concurrent getRoomUserCount requests and resolves pending request on close', async () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     const ws = lastWs();
+    extension._roomInfoCache = { clientCount: 9, isHost: false };
 
     const pendingA = extension.getRoomUserCount();
     const pendingB = extension.getRoomUserCount();
@@ -347,15 +349,18 @@ describe('Xserve extension', () => {
     ws.close();
     const result = await pendingA;
     assert.equal(result, 0);
+    assert.equal(extension._roomInfoCache.clientCount, 0);
     assert.equal(extension._roomInfoInFlightPromise, null);
   });
 
   it('clears host room state when room_deleted is received', () => {
     extension.isHost = true;
     extension.currentRoom = 'myRoom';
+    extension._roomInfoCache = { clientCount: 5, isHost: true };
     extension._handleMessage(JSON.stringify({ type: 'room_deleted', room: 'myRoom' }));
     assert.equal(extension.isHost, false);
     assert.equal(extension.currentRoom, '');
+    assert.equal(extension._roomInfoCache.clientCount, 0);
   });
 
   it('downloads the server asset to the expected filename', () => {
@@ -371,12 +376,12 @@ describe('Xserve extension', () => {
   it('fetches server health status from the HTTP endpoint', async () => {
     await extension.connectToServer({ URL: 'wss://example.com' });
     let fetchEndpoint = '';
-    mock.fetch = async endpoint => {
+    mock.fetch = endpoint => {
       fetchEndpoint = endpoint;
-      return {
+      return Promise.resolve({
         ok: true,
-        json: async () => ({ status: 'ok' }),
-      };
+        json: () => Promise.resolve({ status: 'ok' }),
+      });
     };
 
     const status = await extension.getServerHealth();
@@ -389,12 +394,12 @@ describe('Xserve extension', () => {
     extension.setServerAdminToken({ TOKEN: 'secret-token' });
 
     let requestHeaders = null;
-    mock.fetch = async (_endpoint, options) => {
+    mock.fetch = (_endpoint, options) => {
       requestHeaders = options?.headers || {};
-      return {
+      return Promise.resolve({
         ok: true,
-        json: async () => ({ activeRooms: 2 }),
-      };
+        json: () => Promise.resolve({ activeRooms: 2 }),
+      });
     };
 
     const stats = await extension.getServerStats();
