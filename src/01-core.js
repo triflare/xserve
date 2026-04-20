@@ -5,6 +5,9 @@ if (!Scratch.extensions.unsandboxed) {
 const HEARTBEAT_INTERVAL_MS = 30000;
 const PUBLIC_ROOMS_TIMEOUT_MS = 3000;
 const PUBLIC_ROOMS_REFRESH_MS = 5000;
+const ROOM_INFO_TIMEOUT_MS = 3000;
+const SERVER_INFO_FALLBACK = Scratch.translate('unavailable');
+const XSERVE_VERSION = '2.0.0';
 
 class tfXserve {
   constructor() {
@@ -28,7 +31,15 @@ class tfXserve {
     this._publicRoomsTimeout = null;
     this._publicRoomsInFlightPromise = null;
     this._publicRoomsLastFetchAt = 0;
+    this._roomInfoCache = { clientCount: 0, isHost: false };
+    this._roomInfoResolve = null;
+    this._roomInfoTimeout = null;
+    this._roomInfoInFlightPromise = null;
+    this._serverBaseUrl = '';
+    this._serverAdminToken = '';
+    this._serverStatsCache = '{}';
     this._heartbeatInterval = null;
+    this._lastError = '';
   }
 
   getInfo() {
@@ -51,7 +62,7 @@ class tfXserve {
           arguments: {
             URL: {
               type: Scratch.ArgumentType.STRING,
-              defaultValue: 'wss://your-server-url',
+              defaultValue: 'wss://xserver.sdisk.us',
             },
           },
         },
@@ -59,6 +70,17 @@ class tfXserve {
           opcode: 'disconnect',
           blockType: Scratch.BlockType.COMMAND,
           text: Scratch.translate('disconnect from Xserver'),
+        },
+        {
+          opcode: 'setServerAdminToken',
+          blockType: Scratch.BlockType.COMMAND,
+          text: Scratch.translate('set server admin token to [TOKEN]'),
+          arguments: {
+            TOKEN: {
+              type: Scratch.ArgumentType.STRING,
+              defaultValue: '',
+            },
+          },
         },
         '---',
         {
@@ -89,7 +111,7 @@ class tfXserve {
         {
           opcode: 'isConnected',
           blockType: Scratch.BlockType.BOOLEAN,
-          text: Scratch.translate('connected to a server?'),
+          text: Scratch.translate('am I connected to a server?'),
         },
         {
           opcode: 'amIHost',
@@ -106,6 +128,31 @@ class tfXserve {
           opcode: 'getPublicRooms',
           blockType: Scratch.BlockType.REPORTER,
           text: Scratch.translate('public servers'),
+        },
+        {
+          opcode: 'getServerHealth',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('server health status'),
+        },
+        {
+          opcode: 'getServerStats',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('server stats'),
+        },
+        {
+          opcode: 'getXserveVersion',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('Xserve + Xserver version'),
+        },
+        {
+          opcode: 'getRoomUserCount',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('room client count'),
+        },
+        {
+          opcode: 'getLastError',
+          blockType: Scratch.BlockType.REPORTER,
+          text: Scratch.translate('last error'),
         },
         '---',
         {
@@ -223,6 +270,7 @@ class tfXserve {
             /[\r\n]/g,
             ''
           );
+          this._lastError = safeErrorMessage;
           console.error('Xserve Error:', safeErrorMessage);
         }
 
@@ -257,6 +305,24 @@ class tfXserve {
         return;
       }
 
+      if (msg.type === 'room_info') {
+        const parsedCount = Number(msg.clientCount);
+        this._roomInfoCache = {
+          clientCount: Number.isFinite(parsedCount) ? Math.max(0, parsedCount) : 0,
+          isHost: Boolean(msg.isHost),
+        };
+        if (this._roomInfoResolve) {
+          this._roomInfoResolve(this._roomInfoCache.clientCount);
+          this._roomInfoResolve = null;
+        }
+        if (this._roomInfoTimeout) {
+          clearTimeout(this._roomInfoTimeout);
+          this._roomInfoTimeout = null;
+        }
+        this._roomInfoInFlightPromise = null;
+        return;
+      }
+
       if (msg.type === 'kicked') {
         console.warn('Xserve: You were removed from the room by the host.');
         if (this.ws) {
@@ -266,6 +332,7 @@ class tfXserve {
       }
 
       if (msg.type === 'room_deleted') {
+        this._roomInfoCache = { clientCount: 0, isHost: false };
         this.isHost = false;
         this.currentRoom = '';
         this.connected = false;
@@ -300,7 +367,11 @@ class tfXserve {
   }
 
   _formatPublicRooms() {
-    return this._publicRoomsCache.join(', ');
+    try {
+      return JSON.stringify(this._publicRoomsCache);
+    } catch {
+      return '[]';
+    }
   }
 
   _clearPendingPublicRoomsRequest(shouldResolveWithCache) {
@@ -316,6 +387,19 @@ class tfXserve {
     }
   }
 
+  _clearPendingRoomInfoRequest(shouldResolveWithCache) {
+    if (this._roomInfoTimeout) {
+      clearTimeout(this._roomInfoTimeout);
+      this._roomInfoTimeout = null;
+    }
+    const pendingResolve = this._roomInfoResolve;
+    this._roomInfoResolve = null;
+    this._roomInfoInFlightPromise = null;
+    if (shouldResolveWithCache && pendingResolve) {
+      pendingResolve(this._roomInfoCache.clientCount);
+    }
+  }
+
   _startHeartbeat() {
     this._stopHeartbeat();
     this._heartbeatInterval = setInterval(() => {
@@ -323,6 +407,64 @@ class tfXserve {
         this.ws.send(JSON.stringify({ type: 'ping' }));
       }
     }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  _deriveServerBaseUrl(rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.protocol === 'ws:') {
+        parsed.protocol = 'http:';
+      } else if (parsed.protocol === 'wss:') {
+        parsed.protocol = 'https:';
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return '';
+      }
+      parsed.pathname = '';
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.origin;
+    } catch {
+      return '';
+    }
+  }
+
+  _withVersionParam(rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      parsed.searchParams.set('xserveVersion', XSERVE_VERSION);
+      return parsed.toString();
+    } catch {
+      return rawUrl;
+    }
+  }
+
+  _setLastError(message) {
+    this._lastError = Scratch.Cast.toString(message).replace(/[\r\n]/g, '');
+  }
+
+  async _fetchServerEndpoint(pathname) {
+    if (!this._serverBaseUrl) {
+      return null;
+    }
+    const endpoint = `${this._serverBaseUrl}${pathname}`;
+    if (!(await Scratch.canFetch(endpoint))) {
+      return null;
+    }
+
+    try {
+      const headers = {};
+      if (this._serverAdminToken) {
+        headers['x-xserve-admin-token'] = this._serverAdminToken;
+      }
+      const response = await Scratch.fetch(endpoint, { headers });
+      if (!response.ok) {
+        return null;
+      }
+      return await response.json();
+    } catch {
+      return null;
+    }
   }
 
   _stopHeartbeat() {
@@ -358,8 +500,12 @@ class tfXserve {
       this.ws.close();
     }
 
-    const url = Scratch.Cast.toString(args.URL);
+    this._lastError = '';
+    const rawUrl = Scratch.Cast.toString(args.URL);
+    const url = this._withVersionParam(rawUrl);
+    this._serverBaseUrl = this._deriveServerBaseUrl(url);
     if (!(await Scratch.canFetch(url))) {
+      this._lastError = 'Cannot fetch URL';
       console.error('Xserve: Cannot fetch URL', url);
       return;
     }
@@ -370,6 +516,7 @@ class tfXserve {
         // eslint-disable-next-line turbowarp/check-can-fetch
         socket = new WebSocket(url);
       } catch (e) {
+        this._lastError = 'Invalid URL';
         console.error('Xserve: Invalid URL', e);
         resolve();
         return;
@@ -387,6 +534,8 @@ class tfXserve {
         if (this.ws !== socket) return;
         this._stopHeartbeat();
         this._clearPendingPublicRoomsRequest(true);
+        this._roomInfoCache = { clientCount: 0, isHost: false };
+        this._clearPendingRoomInfoRequest(true);
         this.connected = false;
         this.isHost = false;
         this.currentRoom = '';
@@ -400,6 +549,7 @@ class tfXserve {
 
       socket.onerror = () => {
         if (this.ws !== socket) return;
+        this._lastError = 'Connection failed';
         console.error('Xserve: Connection failed');
         resolve();
       };
@@ -409,6 +559,7 @@ class tfXserve {
   disconnect() {
     this._stopHeartbeat();
     this._clearPendingPublicRoomsRequest(true);
+    this._clearPendingRoomInfoRequest(true);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -416,6 +567,10 @@ class tfXserve {
     this.connected = false;
     this.isHost = false;
     this.currentRoom = '';
+  }
+
+  setServerAdminToken(args) {
+    this._serverAdminToken = Scratch.Cast.toString(args.TOKEN);
   }
 
   createRoom(args) {
@@ -452,6 +607,14 @@ class tfXserve {
     return this.isHost;
   }
   getMyId() {
+    if (!this.connected) {
+      this._setLastError('Not connected to a server.');
+      return '';
+    }
+    if (this.isHost) {
+      this._setLastError('Hosts do not have a client ID.');
+      return '';
+    }
     return this.myId;
   }
   getLastMessage() {
@@ -485,6 +648,62 @@ class tfXserve {
       this.ws.send(JSON.stringify({ type: 'fetch_rooms' }));
     });
     return this._publicRoomsInFlightPromise;
+  }
+
+  async getServerHealth() {
+    const payload = await this._fetchServerEndpoint('/health');
+    if (!payload || typeof payload.status !== 'string') {
+      return SERVER_INFO_FALLBACK;
+    }
+    return payload.status;
+  }
+
+  async getServerStats() {
+    const payload = await this._fetchServerEndpoint('/stats');
+    if (!payload) {
+      return this._serverStatsCache;
+    }
+    try {
+      this._serverStatsCache = JSON.stringify(payload);
+      return this._serverStatsCache;
+    } catch {
+      return this._serverStatsCache;
+    }
+  }
+
+  async getXserveVersion() {
+    const payload = await this._fetchServerEndpoint('/health');
+    const serverVersion = Scratch.Cast.toString(payload?.version || SERVER_INFO_FALLBACK);
+    return `${XSERVE_VERSION} + ${serverVersion}`;
+  }
+
+  getLastError() {
+    return this._lastError;
+  }
+
+  getRoomUserCount() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return this._roomInfoCache.clientCount;
+    }
+    if (this._roomInfoInFlightPromise) {
+      return this._roomInfoInFlightPromise;
+    }
+
+    this._roomInfoInFlightPromise = new Promise(resolve => {
+      this._roomInfoResolve = resolve;
+      this._roomInfoTimeout = setTimeout(() => {
+        if (this._roomInfoResolve) {
+          this._roomInfoResolve(this._roomInfoCache.clientCount);
+          this._roomInfoResolve = null;
+        }
+        this._roomInfoInFlightPromise = null;
+        this._roomInfoTimeout = null;
+      }, ROOM_INFO_TIMEOUT_MS);
+
+      this.ws.send(JSON.stringify({ type: 'get_room_info' }));
+    });
+
+    return this._roomInfoInFlightPromise;
   }
 
   whenMessageReceived() {
@@ -555,13 +774,19 @@ class tfXserve {
   }
 
   deleteServer() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.isHost) {
-      this.ws.send(
-        JSON.stringify({
-          type: 'delete_room',
-        })
-      );
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this._setLastError('Not connected to a server.');
+      return;
     }
+    if (!this.isHost) {
+      this._setLastError('Only the host can delete a server.');
+      return;
+    }
+    this.ws.send(
+      JSON.stringify({
+        type: 'delete_room',
+      })
+    );
   }
 
   downloadServerSoftware() {

@@ -6,15 +6,18 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import chalk from 'chalk';
 import { timingSafeEqual } from 'node:crypto';
+import { createServer } from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
 
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT });
+const XSERVER_VERSION = '2.0.0';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_MESSAGES_PER_SECOND = 10;
 const RATE_LIMIT_COOLDOWN_MS = 1000;
+const ROOM_EXPIRY_MS = 5 * 60 * 1000;
+const HTTP_ADMIN_TOKEN = String(process.env.XSERVER_ADMIN_TOKEN ?? '');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ROOMS_DB_PATH = path.resolve(__dirname, '../../xserver-rooms.json');
 
@@ -141,6 +144,15 @@ roomStore.load();
 
 // Format: Map<roomName, { host: WebSocket, clients: Map<clientId, WebSocket> }>
 const activeRooms = new Map();
+const roomExpiryTimers = new Map();
+const roomMessageVolume = new Map();
+const serverStats = {
+  startedAt: Date.now(),
+  totalConnections: 0,
+  activeConnections: 0,
+  totalMessagesReceived: 0,
+  totalMessagesRouted: 0,
+};
 let nextClientId = 1;
 
 // --- Logger Utilities ---
@@ -176,6 +188,130 @@ const log = {
     ),
 };
 
+const clearRoomExpiry = roomName => {
+  const timerEntry = roomExpiryTimers.get(roomName);
+  if (!timerEntry) return;
+  clearTimeout(timerEntry.timeout);
+  roomExpiryTimers.delete(roomName);
+};
+
+const scheduleRoomExpiry = roomName => {
+  clearRoomExpiry(roomName);
+  const expiresAt = Date.now() + ROOM_EXPIRY_MS;
+  const timeout = setTimeout(() => {
+    try {
+      roomExpiryTimers.delete(roomName);
+      if (activeRooms.has(roomName)) return;
+      if (!roomStore.getRoom(roomName)) return;
+      roomStore.deleteRoom(roomName);
+      roomMessageVolume.delete(roomName);
+      log.info(`Room expired after host inactivity | Room: "${roomName}"`);
+    } catch (error) {
+      const safeErrorMessage = String(error?.message ?? 'Unknown error')
+        .replace(/[\r\n]/g, '')
+        .replace(/[^\x20-\x7E]/g, '')
+        .slice(0, 200);
+      log.error(
+        `Failed room expiry cleanup | Room: "${roomName}" | Error: ${safeErrorMessage}`
+      );
+    }
+  }, ROOM_EXPIRY_MS);
+  roomExpiryTimers.set(roomName, { timeout, expiresAt });
+  log.info(`Scheduled room expiry | Room: "${roomName}" | In: ${ROOM_EXPIRY_MS}ms`);
+};
+
+const recordRoomMessage = (roomName, count = 1) => {
+  if (!roomName) return;
+  const currentCount = roomMessageVolume.get(roomName) || 0;
+  roomMessageVolume.set(roomName, currentCount + count);
+};
+
+const isRoomPublic = roomName => {
+  const roomRecord = roomStore.getRoom(roomName);
+  if (!roomRecord) return false;
+  return !roomRecord.password || roomRecord.isPublic;
+};
+
+const getStatsPayload = (includeSensitiveDetails = false) => ({
+  uptimeSeconds: Math.floor((Date.now() - serverStats.startedAt) / 1000),
+  activeRooms: activeRooms.size,
+  activeConnections: serverStats.activeConnections,
+  totalConnections: serverStats.totalConnections,
+  totalMessagesReceived: serverStats.totalMessagesReceived,
+  totalMessagesRouted: serverStats.totalMessagesRouted,
+  rooms: Array.from(activeRooms.entries()).map(([roomName, room]) => ({
+    room: includeSensitiveDetails || isRoomPublic(roomName) ? roomName : '',
+    isPublic: isRoomPublic(roomName),
+    clientCount: room.clients.size + 1,
+    isOnline: room.host.readyState === WebSocket.OPEN,
+    messageVolume: roomMessageVolume.get(roomName) || 0,
+  })),
+  expiringRooms: Array.from(roomExpiryTimers.entries()).map(([roomName, timerEntry]) => ({
+    room: includeSensitiveDetails || isRoomPublic(roomName) ? roomName : '',
+    expiresInMs: Math.max(0, timerEntry.expiresAt - Date.now()),
+  })),
+});
+
+const extractAuthToken = req => {
+  const headerToken = String(req.headers['x-xserve-admin-token'] ?? '').trim();
+  if (headerToken) return headerToken;
+  const authorization = String(req.headers.authorization ?? '').trim();
+  if (authorization.toLowerCase().startsWith('bearer ')) {
+    return authorization.slice(7).trim();
+  }
+  return '';
+};
+
+const hasValidAdminToken = req => {
+  if (!HTTP_ADMIN_TOKEN) return false;
+  const providedToken = extractAuthToken(req);
+  if (!providedToken) return false;
+  return safeStringEquals(providedToken, HTTP_ADMIN_TOKEN);
+};
+
+const httpServer = createServer((req, res) => {
+  const requestUrl = new URL(req.url || '/', 'http://localhost');
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-xserve-admin-token',
+  };
+  const sendJson = (statusCode, body) => {
+    res.writeHead(statusCode, { ...corsHeaders, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders);
+    res.end();
+    return;
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/health') {
+    const isHealthy = httpServer.listening;
+    sendJson(isHealthy ? 200 : 503, {
+      status: isHealthy ? 'ok' : 'not_ready',
+      version: XSERVER_VERSION,
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/stats') {
+    const includeSensitiveDetails = hasValidAdminToken(req);
+    if (HTTP_ADMIN_TOKEN && !includeSensitiveDetails) {
+      sendJson(401, { error: 'Unauthorized' });
+      return;
+    }
+    sendJson(200, getStatsPayload(includeSensitiveDetails));
+    return;
+  }
+
+  sendJson(404, { error: 'Not found' });
+});
+
+const wss = new WebSocketServer({ server: httpServer });
+httpServer.listen(PORT);
+
 // --- Startup Banner ---
 console.log(chalk.blue.bold('================================================'));
 console.log(chalk.blue.bold(' Xserve Signalling Server (Xserver)'));
@@ -197,6 +333,21 @@ const parsePublicFlag = value =>
     .toLowerCase() === 'true';
 
 wss.on('connection', (ws, req) => {
+  const connectionUrl = new URL(req.url || '/', 'http://localhost');
+  const clientVersion = String(
+    connectionUrl.searchParams.get('xserveVersion') ?? ''
+  ).trim();
+  if (!safeStringEquals(clientVersion, XSERVER_VERSION)) {
+    ws.send(
+      JSON.stringify({
+        type: 'error',
+        message: `Version mismatch. Expected ${XSERVER_VERSION}.`,
+      })
+    );
+    ws.close();
+    return;
+  }
+
   let currentRoom = null;
   let isHost = false;
   const myClientId = nextClientId++;
@@ -204,6 +355,8 @@ wss.on('connection', (ws, req) => {
   let rateWindowStart = Date.now();
   let rateWindowCount = 0;
   let blockedUntil = 0;
+  serverStats.totalConnections++;
+  serverStats.activeConnections++;
 
   log.info(`New connection established | Client ID: ${myClientId} | IP: ${clientIp}`);
 
@@ -238,6 +391,7 @@ wss.on('connection', (ws, req) => {
     }
 
     const messageAsString = rawMessage.toString();
+    serverStats.totalMessagesReceived++;
     log.verbose(`Raw payload from Client ${myClientId}: ${messageAsString}`);
 
     try {
@@ -275,6 +429,7 @@ wss.on('connection', (ws, req) => {
             password,
             isPublic: parsePublicFlag(data.public),
           });
+          clearRoomExpiry(sanitizedRoom);
           activeRooms.set(sanitizedRoom, { host: ws, clients: new Map() });
 
           currentRoom = sanitizedRoom;
@@ -346,6 +501,8 @@ wss.on('connection', (ws, req) => {
                 data: data.data,
               })
             );
+            serverStats.totalMessagesRouted++;
+            recordRoomMessage(currentRoom);
             log.verbose(
               `Message routed to host | From: Client ${myClientId} | Room: "${currentRoom}"`
             );
@@ -367,6 +524,8 @@ wss.on('connection', (ws, req) => {
                   data: data.data,
                 })
               );
+              serverStats.totalMessagesRouted++;
+              recordRoomMessage(currentRoom);
               log.verbose(
                 `Message routed to client | Target: ${sanitizedTarget} | Room: "${currentRoom}"`
               );
@@ -395,10 +554,21 @@ wss.on('connection', (ws, req) => {
                 broadcastCount++;
               }
             });
+            if (broadcastCount > 0) {
+              serverStats.totalMessagesRouted += broadcastCount;
+              recordRoomMessage(currentRoom, broadcastCount);
+            }
             log.verbose(
               `Broadcast sent | Room: "${currentRoom}" | Recipients: ${broadcastCount}`
             );
           }
+          break;
+        }
+
+        case 'get_room_info': {
+          const currentActiveRoom = currentRoom ? activeRooms.get(currentRoom) : null;
+          const clientCount = currentActiveRoom ? currentActiveRoom.clients.size + 1 : 0;
+          ws.send(JSON.stringify({ type: 'room_info', clientCount, isHost }));
           break;
         }
 
@@ -449,8 +619,10 @@ wss.on('connection', (ws, req) => {
               }
             });
             const deletedRoomName = currentRoom;
+            clearRoomExpiry(currentRoom);
             activeRooms.delete(currentRoom);
             roomStore.deleteRoom(currentRoom);
+            roomMessageVolume.delete(deletedRoomName);
             currentRoom = null;
             isHost = false;
             ws.send(JSON.stringify({ type: 'room_deleted', room: deletedRoomName }));
@@ -481,6 +653,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    serverStats.activeConnections = Math.max(0, serverStats.activeConnections - 1);
     log.info(`Connection closed | Client ID: ${myClientId}`);
 
     const currentActiveRoom = currentRoom ? activeRooms.get(currentRoom) : null;
@@ -502,6 +675,7 @@ wss.on('connection', (ws, req) => {
           }
         });
         activeRooms.delete(currentRoom);
+        scheduleRoomExpiry(currentRoom);
         log.warn(
           `Host disconnected, room is now offline | Room: "${currentRoom}" | Evicted Clients: ${evictedCount}`
         );
