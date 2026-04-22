@@ -2,8 +2,6 @@
 
 Xserver is the server program that powers Xserve rooms.
 
-If Xserve is the extension in Scratch, Xserver is the service that keeps hosts and clients connected.
-
 ## Quick start
 
 1. Make sure you have Node.js installed.
